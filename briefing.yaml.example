@@ -1,0 +1,25 @@
+# Copy to briefing.yaml and customize. Used by: python -m briefing
+
+# RSS/Atom feeds (only articles on allowed domains are fetched)
+feeds:
+  - url: https://feeds.reuters.com/reuters/businessNews
+    label: Reuters Business
+  - url: https://www.economist.com/finance-and-economics/rss.xml
+    label: Economist Finance
+
+# Optional topic deep dives (matched against feed titles/descriptions)
+deep_dives:
+  - ballroom security money
+
+# Subject filters: include items whose title/description matches any keyword
+subjects:
+  - name: Economy
+    keywords:
+      - economy
+      - inflation
+      - markets
+      - gdp
+      - federal reserve
+
+max_articles_per_feed: 5
+max_articles_total: 25

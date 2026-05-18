@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+data/
+test_articles/*
+!test_articles/.gitkeep
+credentials/
+briefing.yaml
