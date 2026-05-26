@@ -1,0 +1,20 @@
+{
+  "replacements": [
+    {"from": "U.S.A.", "to": "United States"},
+    {"from": "U.S.", "to": "United States"},
+    {"from": "U.S", "to": "United States"},
+    {"from": "U.K.", "to": "United Kingdom"},
+    {"from": "U.K", "to": "United Kingdom"},
+    {"from": "E.U.", "to": "European Union"},
+    {"from": "E.U", "to": "European Union"},
+    {"from": "U.N.", "to": "United Nations"},
+    {"from": "U.N", "to": "United Nations"}
+  ],
+  "regex": [
+    {
+      "pattern": "\\bPolish\\b(?=\\s+(?:government|army|president|minister|parliament|forces|troops|people|nation|leader|election|border|capital|delegation|officials|authorities|regime|coalition|party|zloty|Warsaw))",
+      "replace": "Poleish",
+      "flags": "i"
+    }
+  ]
+}

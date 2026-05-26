@@ -140,6 +140,43 @@ def _playwright_eligible(hostname: str | None) -> bool:
     return host_allowed(hostname, set(config.PLAYWRIGHT_FALLBACK_DOMAINS))
 
 
+def _wordpress_api_eligible(hostname: str | None) -> bool:
+    if not hostname or not config.WORDPRESS_API_DOMAINS:
+        return False
+    return host_allowed(hostname, set(config.WORDPRESS_API_DOMAINS))
+
+
+async def _try_wordpress_api_fetch(
+    client: httpx.AsyncClient,
+    url: str,
+    byte_limit: int,
+    allowed_domains: set[str],
+) -> FetchOk | FetchOversizeKnown | None:
+    from fetch_wordpress import wordpress_fetch_html
+
+    result = await wordpress_fetch_html(
+        client,
+        url,
+        allowed_domains,
+        api_domains=set(config.WORDPRESS_API_DOMAINS),
+    )
+    if result is None:
+        return None
+    raw, final_url = result
+    n = len(raw)
+    if n > byte_limit:
+        return FetchOversizeKnown(
+            final_url=final_url,
+            content_length=n,
+            soft_limit=byte_limit,
+        )
+    return FetchOk(
+        content=raw,
+        final_url=final_url,
+        content_type="text/html; charset=utf-8",
+    )
+
+
 def validate_target_url(url: str, allowed_domains: set[str], allow_http: bool) -> None:
     parsed = urlparse(url)
     if not parsed.hostname:
@@ -204,34 +241,47 @@ async def fetch_url(
             if status < 200 or status >= 400:
                 await resp.aclose()
                 response_closed = True
-                if status == 403 and _playwright_eligible(urlparse(url).hostname):
-                    try:
-                        from fetch_playwright import playwright_fetch_html
-                    except ImportError as e:
-                        raise FetchError(
-                            "HTTP 403 — site blocked the request (often Cloudflare). "
-                            "Install Playwright: pip install playwright && playwright install chromium"
-                        ) from e
-                    try:
-                        raw, final_url, ct = await playwright_fetch_html(
-                            url,
-                            allowed_domains,
-                            allow_http=allow_http,
-                            user_agent=user_agent,
-                            timeout_ms=config.PLAYWRIGHT_TIMEOUT_MS,
+                if status == 403:
+                    hostname = urlparse(url).hostname
+                    if _wordpress_api_eligible(hostname):
+                        wp = await _try_wordpress_api_fetch(
+                            client, url, byte_limit, allowed_domains
                         )
-                    except RuntimeError as e:
-                        raise FetchError(str(e)) from e
-                    except Exception as e:
-                        raise FetchError(f"Browser fetch failed: {e}") from e
-                    n = len(raw)
-                    if n > byte_limit:
-                        return FetchOversizeKnown(
-                            final_url=final_url,
-                            content_length=n,
-                            soft_limit=byte_limit,
+                        if wp is not None:
+                            return wp
+                    if _playwright_eligible(hostname):
+                        try:
+                            from fetch_playwright import playwright_fetch_html
+                        except ImportError as e:
+                            raise FetchError(
+                                "HTTP 403 — site blocked the request (often Cloudflare). "
+                                "Install patchright: pip install patchright && patchright install chromium"
+                            ) from e
+                        try:
+                            raw, final_url, ct = await playwright_fetch_html(
+                                url,
+                                allowed_domains,
+                                allow_http=allow_http,
+                                user_agent=user_agent,
+                                timeout_ms=config.PLAYWRIGHT_TIMEOUT_MS,
+                            )
+                        except RuntimeError as e:
+                            raise FetchError(str(e)) from e
+                        except Exception as e:
+                            from fetch_playwright import close_playwright
+
+                            await close_playwright()
+                            raise FetchError(f"Browser fetch failed: {e}") from e
+                        n = len(raw)
+                        if n > byte_limit:
+                            return FetchOversizeKnown(
+                                final_url=final_url,
+                                content_length=n,
+                                soft_limit=byte_limit,
+                            )
+                        return FetchOk(
+                            content=raw, final_url=final_url, content_type=ct
                         )
-                    return FetchOk(content=raw, final_url=final_url, content_type=ct)
 
                 raise FetchError(f"HTTP {status}")
 

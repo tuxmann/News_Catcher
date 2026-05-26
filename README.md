@@ -25,7 +25,7 @@ If you maintain a fork or publish this repo, add [Topics](https://docs.github.co
 - Oversize download prompt (**Proceed / Cancel**) using soft and hard byte limits
 - Paragraph-aware chunking for Telegram with `N of M` chunk headers
 - Clear error messages for common anti-bot blocks (`401`, `403`)
-- Playwright fallback for Cloudflare-protected domains (default: `economist.com`)
+- Patchright (stealth Playwright) fallback for Cloudflare-protected domains (default: `economist.com`, `marktechpost.com`)
 - Startup online notification to allowed Telegram users
 - **Speak last article**: after a URL, send `newscatcher, speak to me` for TTS audio (KittenTTS)
 - **Overnight briefing** (optional): `python -m briefing` → Google Drive (`briefing.yaml`, see `.env.example`)
@@ -83,10 +83,10 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-3. Install Playwright browser runtime (required for Economist/Cloudflare fallback):
+3. Install Patchright browser runtime (required for Economist/MarkTechPost/Cloudflare fallback):
 
 ```bash
-playwright install chromium
+patchright install chromium
 ```
 
 4. Create your `.env` from `.env.example` and set values:
@@ -158,6 +158,46 @@ pip install -r requirements.txt
 
 Default model: `KittenML/kitten-tts-mini-0.8`. Voices: `Bella`, `Jasper`, `Luna`, `Bruno`, `Rosie`, `Hugo`, `Kiki`, `Leo` (set `TTS_VOICE` in `.env`).
 
+#### TTS pronunciation normalization
+
+KittenTTS cannot disambiguate homographs (e.g. **Polish** the country vs. nail polish) and often pauses on dotted abbreviations like **U.S.** because its internal chunker splits on periods. News Catcher applies your rules **before** synthesis.
+
+1. Edit [`tts_replacements.json`](tts_replacements.json) in the project root (or point elsewhere with `TTS_REPLACEMENTS_FILE` in `.env`).
+2. Keep `TTS_NORMALIZE_ENABLED=1` (default). Set to `0` to pass article text through unchanged.
+3. Restart the bot or re-run `test_article_to_audio.py` after changing the JSON (rules are cached per process).
+
+**File format:**
+
+```json
+{
+  "replacements": [
+    {"from": "U.S.", "to": "United States"},
+    {"from": "U.K.", "to": "United Kingdom"}
+  ],
+  "regex": [
+    {
+      "pattern": "\\bPolish\\b(?=\\s+government)",
+      "replace": "Poleish",
+      "flags": "i"
+    }
+  ]
+}
+```
+
+- **`replacements`** — simple find-and-replace strings, applied in file order (longer `from` strings are applied first automatically so `U.S.A.` wins over `U.S.`).
+- **`regex`** — optional Python regex rules; use for context (country sense of *Polish* only before *government*, *army*, etc.). Optional `"flags": "i"` for case-insensitive.
+
+Shipped defaults expand common abbreviations (`U.S.`, `U.K.`, `E.U.`, `U.N.`) and rewrite *Polish* before news-y following words to **Poleish** (a spelling KittenTTS reads as the country). Add your own entries for `Turkey`, `Jordan`, `Georgia`, outlet-specific names, etc.
+
+**Try a phrase locally:**
+
+```python
+from tts_normalize import normalize_for_tts
+print(normalize_for_tts("The Polish government and the U.S. envoy met."))
+```
+
+Normalization runs on Telegram **speak**, overnight **briefing** audio, and `test_article_to_audio.py` (all use `synthesize_to_mp3` in `tts.py`).
+
 ### Commands
 
 - `/start` - intro/help
@@ -187,12 +227,17 @@ If soft limit is exceeded, the bot prompts:
 
 Some sites (notably Economist) may return `HTTP 403` to plain HTTP clients.
 
-For domains in `PLAYWRIGHT_FALLBACK_DOMAINS`, the bot retries via headless Chromium.
+On `HTTP 403`, the bot tries fallbacks in order:
+
+1. **WordPress REST API** for domains in `WORDPRESS_API_DOMAINS` (default: `marktechpost.com`) — no browser required.
+2. **Headless Chromium** (patchright) for domains in `PLAYWRIGHT_FALLBACK_DOMAINS`.
 
 Config:
 
-- `PLAYWRIGHT_FALLBACK_DOMAINS` (default when omitted: `economist.com`)
+- `WORDPRESS_API_DOMAINS` (default when omitted: `marktechpost.com`)
+- `PLAYWRIGHT_FALLBACK_DOMAINS` (default when omitted: `economist.com`, `marktechpost.com`)
 - `PLAYWRIGHT_TIMEOUT_MS` (default: `60000`)
+- `PLAYWRIGHT_CHANNEL` (optional; defaults to `chrome` when `google-chrome` is installed)
 
 To disable fallback, set:
 
@@ -240,13 +285,13 @@ Includes tests for:
 - Use a browser-like `USER_AGENT` (default in `.env.example`)
 - Do not append a custom bot token/name to the UA string
 
-### `HTTP 403` (commonly Economist)
+### `HTTP 403` (commonly Economist, MarkTechPost)
 
-- Install Playwright browser:
-  - `playwright install chromium`
-- Ensure the domain is in `PLAYWRIGHT_FALLBACK_DOMAINS`
+- Install Patchright browser:
+  - `patchright install chromium`
+- Ensure the domain is in `PLAYWRIGHT_FALLBACK_DOMAINS` (marktechpost.com is included by default)
 
-### Playwright warning on Linux Mint
+### Patchright warning on Linux Mint
 
 You may see:
 

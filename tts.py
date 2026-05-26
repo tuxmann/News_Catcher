@@ -10,6 +10,7 @@ import tempfile
 from pathlib import Path
 
 import config
+from tts_normalize import normalize_for_tts
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +172,7 @@ def synthesize_to_mp3(
         raise RuntimeError("TTS is disabled (set TTS_ENABLED=1).")
 
     narration = build_narration_text(title, text)
+    narration = normalize_for_tts(narration)
     chunks = chunk_text_for_tts(narration, max_chars=chunk_chars)
     if not chunks:
         raise ValueError("No text to synthesize.")

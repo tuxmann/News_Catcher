@@ -51,9 +51,9 @@ def _fetch_error_reply(exc: FetchError) -> str:
         )
     if s == "HTTP 403":
         return (
-            "HTTP 403 — the site blocked the request. For Cloudflare-protected publishers "
-            "(e.g. economist.com), the bot uses Playwright after this error; run "
-            "`playwright install chromium` and keep PLAYWRIGHT_FALLBACK_DOMAINS (see .env.example)."
+            "HTTP 403 — the site blocked the request. MarkTechPost uses the WordPress API "
+            "fallback automatically; other Cloudflare sites need patchright "
+            "(patchright install chromium) and PLAYWRIGHT_FALLBACK_DOMAINS — see .env.example."
         )
     return s
 

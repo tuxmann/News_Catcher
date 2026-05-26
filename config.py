@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -62,20 +63,42 @@ CAPTURE_ARTICLE_IMAGES = _bool("CAPTURE_ARTICLE_IMAGES", False)
 PENDING_OVERSIZE_TTL = 300
 
 # If plain HTTP gets 403, retry with headless Chromium for these registrable domains
-# (Cloudflare "challenge" pages). Unset = economist.com; empty value = disabled.
+# (Cloudflare "challenge" pages). Unset = economist.com,marktechpost.com; empty = off.
 _pw_raw = os.environ.get("PLAYWRIGHT_FALLBACK_DOMAINS")
 if _pw_raw is None:
-    _pw_domains = ["economist.com"]
+    _pw_domains = ["economist.com", "marktechpost.com"]
 else:
+    # Strip optional surrounding quotes (dotenv may leave them when value contains commas).
+    _pw_raw = _pw_raw.strip().strip('"').strip("'")
     _pw_domains = [x.strip().lower() for x in _pw_raw.split(",") if x.strip()]
 PLAYWRIGHT_FALLBACK_DOMAINS: frozenset[str] = frozenset(_pw_domains)
 PLAYWRIGHT_TIMEOUT_MS = _int("PLAYWRIGHT_TIMEOUT_MS", 60_000)
+# Optional system Chrome channel for patchright/playwright (e.g. "chrome"). Empty = bundled Chromium.
+# When unset, use system Google Chrome if installed (better Cloudflare pass rate).
+_pw_channel_raw = os.environ.get("PLAYWRIGHT_CHANNEL")
+if _pw_channel_raw is None:
+    PLAYWRIGHT_CHANNEL = "chrome" if shutil.which("google-chrome") else ""
+else:
+    PLAYWRIGHT_CHANNEL = _pw_channel_raw.strip()
+
+# On HTTP 403, try WordPress REST API before headless browser (no Cloudflare on many hosts).
+_wp_api_raw = os.environ.get("WORDPRESS_API_DOMAINS")
+if _wp_api_raw is None:
+    _wp_api_domains = ["marktechpost.com"]
+else:
+    _wp_api_raw = _wp_api_raw.strip().strip('"').strip("'")
+    _wp_api_domains = [x.strip().lower() for x in _wp_api_raw.split(",") if x.strip()]
+WORDPRESS_API_DOMAINS: frozenset[str] = frozenset(_wp_api_domains)
 
 # Phase 1: speak last article (TTS + Telegram audio)
 TTS_ENABLED = _bool("TTS_ENABLED", True)
 TTS_MODEL = os.environ.get("TTS_MODEL", "KittenML/kitten-tts-mini-0.8").strip()
 TTS_VOICE = os.environ.get("TTS_VOICE", "Jasper").strip()
 TTS_CHUNK_CHARS = _int("TTS_CHUNK_CHARS", 3500)
+TTS_NORMALIZE_ENABLED = _bool("TTS_NORMALIZE_ENABLED", True)
+TTS_REPLACEMENTS_FILE = Path(os.environ.get("TTS_REPLACEMENTS_FILE", "tts_replacements.json"))
+if not TTS_REPLACEMENTS_FILE.is_absolute():
+    TTS_REPLACEMENTS_FILE = PROJECT_ROOT / TTS_REPLACEMENTS_FILE
 LAST_ARTICLE_TTL_SECONDS = _int("LAST_ARTICLE_TTL_SECONDS", 72 * 3600)
 ARTICLE_CACHE_DIR = Path(os.environ.get("ARTICLE_CACHE_DIR", "data/article_cache"))
 if not ARTICLE_CACHE_DIR.is_absolute():

@@ -14,6 +14,29 @@ _playwright = None
 _browser = None
 _lock = asyncio.Lock()
 
+_PAGE_READY_JS = """
+() => {
+  const t = (document.title || "").toLowerCase();
+  if (!document.title) return false;
+  if (t.includes("just a moment")) return false;
+  if (t.includes("403") || t.includes("forbidden")) return false;
+  if (t.includes("access denied")) return false;
+  return true;
+}
+"""
+
+
+async def _async_playwright_module():
+    """Prefer patchright (stealth-patched Playwright); fall back to stock playwright."""
+    try:
+        from patchright.async_api import async_playwright
+
+        return async_playwright
+    except ImportError:
+        from playwright.async_api import async_playwright
+
+        return async_playwright
+
 
 async def close_playwright() -> None:
     global _playwright, _browser
@@ -36,17 +59,38 @@ async def _get_browser():
     global _playwright, _browser
     async with _lock:
         if _browser is None:
+            async_playwright = await _async_playwright_module()
             try:
-                from playwright.async_api import async_playwright
-            except ImportError as e:
+                _playwright = await async_playwright().start()
+            except Exception as e:
                 raise RuntimeError(
-                    "playwright is not installed. Run: pip install playwright && playwright install chromium"
+                    "Browser automation is not installed. Run: pip install patchright && "
+                    "patchright install chromium"
                 ) from e
-            _playwright = await async_playwright().start()
-            _browser = await _playwright.chromium.launch(
-                headless=True,
-                args=["--disable-blink-features=AutomationControlled"],
-            )
+            launch_kwargs: dict = {
+                "headless": True,
+                "args": ["--disable-blink-features=AutomationControlled"],
+            }
+            import config
+
+            channel = config.PLAYWRIGHT_CHANNEL
+            if channel:
+                launch_kwargs["channel"] = channel
+            try:
+                _browser = await _playwright.chromium.launch(**launch_kwargs)
+            except Exception as e:
+                if channel:
+                    logger.warning(
+                        "Chromium channel %r unavailable (%s); using bundled browser",
+                        channel,
+                        e,
+                    )
+                    _browser = await _playwright.chromium.launch(
+                        headless=True,
+                        args=launch_kwargs["args"],
+                    )
+                else:
+                    raise
         return _browser
 
 
@@ -73,10 +117,14 @@ async def playwright_fetch_html(
     """
     Load URL in Chromium; wait for Cloudflare interstitial to clear.
     Returns (html_bytes, final_url, content_type). Caller enforces byte limits.
+
+    user_agent is accepted for API compatibility but intentionally not applied:
+    overriding the browser UA often mismatches TLS/CDP fingerprints and triggers
+    blocks (e.g. marktechpost.com with a desktop Chrome 131 string).
     """
+    del user_agent
     browser = await _get_browser()
     context = await browser.new_context(
-        user_agent=user_agent,
         viewport={"width": 1280, "height": 720},
         locale="en-US",
     )
@@ -84,7 +132,7 @@ async def playwright_fetch_html(
     try:
         await page.goto(url, wait_until="load", timeout=timeout_ms)
         await page.wait_for_function(
-            "() => document.title && !document.title.toLowerCase().includes('just a moment')",
+            _PAGE_READY_JS,
             timeout=min(timeout_ms, 45_000),
         )
         final_url = page.url
