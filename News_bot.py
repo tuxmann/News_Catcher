@@ -38,7 +38,13 @@ from fetch import (
     FetchOversizeUnknown,
     fetch_url,
 )
-from tts import is_speak_phrase, split_mp3_for_telegram, synthesize_to_mp3
+from tts import (
+    is_speak_phrase,
+    split_mp3_for_telegram,
+    synthesize_pronunciation_sample,
+    synthesize_to_mp3,
+)
+from tts_normalize import add_literal_replacement
 
 
 def _fetch_error_reply(exc: FetchError) -> str:
@@ -49,12 +55,31 @@ def _fetch_error_reply(exc: FetchError) -> str:
             "Use the default browser-like USER_AGENT from .env.example (remove a short bot-only UA) "
             "and restart the bot."
         )
-    if s == "HTTP 403":
-        return (
-            "HTTP 403 — the site blocked the request. MarkTechPost uses the WordPress API "
-            "fallback automatically; other Cloudflare sites need patchright "
-            "(patchright install chromium) and PLAYWRIGHT_FALLBACK_DOMAINS — see .env.example."
+    if exc.blocked_domain or s.startswith("HTTP 402") or s.startswith("HTTP 403"):
+        domain = exc.blocked_domain or "this site"
+        tried = exc.tried_strategies
+        code = "403"
+        if s.startswith("HTTP "):
+            parts = s.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                code = parts[1]
+        lines = [
+            f"HTTP {code} — {domain} blocked plain HTTP (anti-bot / paywall probe).",
+        ]
+        if tried:
+            lines.append("Tried: " + ", ".join(tried) + ".")
+        lines.extend(
+            [
+                "",
+                "Send the article URL again (bypass runs automatically), or:",
+                f"/fix_403 {domain}",
+                "  — record the domain and retry the last blocked URL",
+                "",
+                "If it keeps failing:",
+                "pip install curl_cffi patchright && patchright install chromium",
+            ]
         )
+        return "\n".join(lines)
     return s
 
 
@@ -71,7 +96,17 @@ logger = logging.getLogger(__name__)
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 
 # Keep in sync with CommandHandler registrations in main().
-_BOT_COMMAND_NAMES = frozenset({"start", "list_domains", "add_domain", "remove_domain"})
+_BOT_COMMAND_NAMES = frozenset(
+    {
+        "start",
+        "list_domains",
+        "add_domain",
+        "remove_domain",
+        "fix_403",
+        "pronounce",
+        "add_pronunciation",
+    }
+)
 
 
 def _leading_command_name(text: str) -> str | None:
@@ -104,6 +139,7 @@ UNLISTED_SLASH_COMMAND = UnlistedSlashCommandFilter()
 
 PENDING_OVERSIZE: dict[str, "PendingOversize"] = {}
 PENDING_DOMAIN_ADD: dict[str, "PendingDomainAdd"] = {}
+PENDING_PRONUNCIATION: dict[str, "PendingPronunciation"] = {}
 
 # Inline actions after an article is delivered (callback_data must be <= 64 bytes).
 _CALLBACK_SPEAK = "a:speak"
@@ -114,6 +150,14 @@ _CALLBACK_SAVE = "a:save"
 class PendingOversize:
     user_id: int
     url: str
+    expires_monotonic: float
+
+
+@dataclass
+class PendingPronunciation:
+    user_id: int
+    from_text: str
+    to_text: str
     expires_monotonic: float
 
 
@@ -354,6 +398,36 @@ def _purge_expired_pending() -> None:
     dead_d = [k for k, v in PENDING_DOMAIN_ADD.items() if now > v.expires_monotonic]
     for k in dead_d:
         del PENDING_DOMAIN_ADD[k]
+    dead_p = [k for k, v in PENDING_PRONUNCIATION.items() if now > v.expires_monotonic]
+    for k in dead_p:
+        del PENDING_PRONUNCIATION[k]
+
+
+def _pending_pronunciation_put(
+    user_id: int, from_text: str, to_text: str
+) -> str:
+    token = secrets.token_urlsafe(8)
+    PENDING_PRONUNCIATION[token] = PendingPronunciation(
+        user_id=user_id,
+        from_text=from_text,
+        to_text=to_text,
+        expires_monotonic=time.monotonic() + config.PENDING_OVERSIZE_TTL,
+    )
+    return token
+
+
+def _pending_pronunciation_get(token: str) -> PendingPronunciation | None:
+    p = PENDING_PRONUNCIATION.get(token)
+    if p is None:
+        return None
+    if time.monotonic() > p.expires_monotonic:
+        del PENDING_PRONUNCIATION[token]
+        return None
+    return p
+
+
+def _pending_pronunciation_remove(token: str) -> None:
+    PENDING_PRONUNCIATION.pop(token, None)
 
 
 def _pending_get(token: str) -> PendingOversize | None:
@@ -471,7 +545,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "If the site is not on your list yet, I will ask whether to add its domain.\n\n"
         "After each article you can tap Speak to me or Save to disk, "
         "or type those phrases.\n\n"
-        "Commands: /list_domains, /add_domain, /remove_domain"
+        "Commands: /list_domains, /add_domain, /remove_domain, /fix_403\n"
+        "TTS: /pronounce <word> <alt1> [alt2…] — hear spellings and save to tts_replacements.json\n"
+        "     /add_pronunciation <from> <to> — add a rule without audio preview"
     )
 
 
@@ -525,6 +601,54 @@ async def cmd_add_domain(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     current.add(domain)
     save_domains(config.DOMAINS_FILE, current)
     await update.message.reply_text(f"Added domain: {domain}")
+
+
+async def cmd_fix_403(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Record a 403-blocked domain and retry the last failed URL (or show usage)."""
+    if not update.effective_user or not update.message:
+        return
+    if not _allowed_user(update.effective_user.id):
+        await update.message.reply_text("You are not authorized.")
+        return
+
+    args = context.args or []
+    pending = context.user_data.get("last_403") or {}
+    url: str | None = None
+    domain: str | None = None
+
+    if args:
+        arg = args[0].strip()
+        if arg.lower().startswith("http://") or arg.lower().startswith("https://"):
+            url = arg
+            domain = registrable_domain_from_url(url)
+        else:
+            domain = normalize_registrable_hint(arg)
+    else:
+        url = pending.get("url")
+        domain = pending.get("domain")
+
+    if not domain or not is_valid_registrable_domain(domain):
+        await update.message.reply_text(
+            "Usage: /fix_403 <domain>\n"
+            "Example: /fix_403 politico.com\n\n"
+            "Or send /fix_403 right after a blocked article URL (retries that link).\n"
+            "You can also pass the full URL:\n"
+            "/fix_403 https://www.politico.com/news/..."
+        )
+        return
+
+    from fallback_domains_store import record_fallback_domain
+
+    record_fallback_domain(domain)
+    await update.message.reply_text(
+        f"Recorded {domain} for 403 bypass. "
+        + ("Fetching article…" if url else "Send the article URL to fetch it.")
+    )
+
+    if url:
+        await _deliver_user_url_fetch(
+            update, context, url, offer_domain_prompt=False
+        )
 
 
 async def cmd_remove_domain(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -590,6 +714,11 @@ async def _deliver_user_url_fetch(
             user_agent=config.USER_AGENT,
         )
     except FetchError as e:
+        if e.blocked_domain and update.effective_user:
+            context.user_data["last_403"] = {
+                "url": getattr(e, "blocked_url", None) or url,
+                "domain": e.blocked_domain,
+            }
         if offer_domain_prompt and str(e) == "Domain is not on the approved list.":
             reject = getattr(e, "rejected_url", None) or url
             domain = registrable_domain_from_url(reject)
@@ -691,6 +820,26 @@ async def _run_save_to_disk(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await _bot_send_text(update, context, f"Saved to:\n{path}", chat_id=chat_id)
 
 
+def _schedule_speak(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run TTS in the background so fetches and other commands are not blocked."""
+    task = asyncio.create_task(
+        _run_speak(update, context),
+        name="speak-article",
+    )
+    tasks: set[asyncio.Task] = context.application.bot_data.setdefault("speak_tasks", set())
+    tasks.add(task)
+
+    def _done(t: asyncio.Task) -> None:
+        tasks.discard(t)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            logger.error("Background speak task failed: %s", exc, exc_info=exc)
+
+    task.add_done_callback(_done)
+
+
 async def _run_speak(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user:
         return
@@ -721,7 +870,11 @@ async def _run_speak(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     await _bot_send_text(
-        update, context, "Generating audio… this may take a few minutes.", chat_id=chat_id
+        update,
+        context,
+        "Generating audio… this may take a few minutes. "
+        "You can fetch another article while you wait.",
+        chat_id=chat_id,
     )
     await context.bot.send_chat_action(chat_id=chat_id, action="upload_audio")
 
@@ -764,8 +917,151 @@ async def _handle_save_to_disk_request(
     await _run_save_to_disk(update, context)
 
 
-async def _handle_speak_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _run_speak(update, context)
+async def cmd_add_pronunciation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not _allowed_user(update.effective_user.id):
+        await update.message.reply_text("You are not authorized.")
+        return
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Usage: /add_pronunciation <from> <to>\n"
+            "Example: /add_pronunciation U.S. United States\n"
+            "Example: /add_pronunciation Polish Poleish"
+        )
+        return
+    from_text = args[0]
+    to_text = " ".join(args[1:])
+    try:
+        added = add_literal_replacement(from_text, to_text)
+    except ValueError as e:
+        await update.message.reply_text(str(e))
+        return
+    path = config.TTS_REPLACEMENTS_FILE.resolve()
+    if added:
+        await update.message.reply_text(
+            f"Added pronunciation rule:\n  {from_text!r} → {to_text!r}\n\nSaved to {path}"
+        )
+    else:
+        await update.message.reply_text(
+            f"Updated existing rule:\n  {from_text!r} → {to_text!r}\n\nSaved to {path}"
+        )
+
+
+async def cmd_pronounce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Generate short audio samples for spelling alternatives; save via inline button."""
+    if not update.effective_user or not update.message:
+        return
+    if not _allowed_user(update.effective_user.id):
+        await update.message.reply_text("You are not authorized.")
+        return
+    if not config.TTS_ENABLED:
+        await update.message.reply_text("Text-to-speech is disabled on this bot.")
+        return
+
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Usage: /pronounce <word-in-article> <how-to-say-it> [<alt2> …]\n\n"
+            "Example:\n"
+            "  /pronounce Polish Poleish Pole-ish\n\n"
+            "You will get a short audio clip for each spelling. Tap Save on the one "
+            "you want added to tts_replacements.json.\n\n"
+            "To add without listening: /add_pronunciation Polish Poleish"
+        )
+        return
+
+    from_text = args[0]
+    alternatives = args[1:]
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if chat_id is None:
+        return
+
+    await update.message.reply_text(
+        f"Generating {len(alternatives)} pronunciation sample(s) for {from_text!r}…"
+    )
+    config.AUDIO_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    user_id = update.effective_user.id
+
+    for alt in alternatives:
+        token = _pending_pronunciation_put(user_id, from_text, alt)
+        out_path = config.AUDIO_OUTPUT_DIR / f"pronounce_{user_id}_{token}.mp3"
+        try:
+            await asyncio.to_thread(
+                synthesize_pronunciation_sample,
+                alt,
+                out_path,
+            )
+        except Exception as e:
+            logger.exception("pronunciation sample failed")
+            _pending_pronunciation_remove(token)
+            await context.bot.send_message(
+                chat_id,
+                f"Could not synthesize {alt!r}: {e}",
+            )
+            continue
+
+        label = f"Save: {from_text!r} → {alt!r}"
+        if len(label) > 60:
+            label = f"Save → {alt!r}"
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(label, callback_data=f"r:{token}")]]
+        )
+        try:
+            with out_path.open("rb") as audio_file:
+                await context.bot.send_audio(
+                    chat_id,
+                    audio=audio_file,
+                    title=f"Pronounce: {alt}",
+                    caption=(
+                        f"Hear how {alt!r} sounds.\n"
+                        f"If you like it, tap Save to write "
+                        f"{from_text!r} → {alt!r} in tts_replacements.json."
+                    ),
+                    reply_markup=keyboard,
+                )
+        except TelegramError as e:
+            await context.bot.send_message(chat_id, f"Could not send sample for {alt!r}: {e}")
+        finally:
+            out_path.unlink(missing_ok=True)
+
+
+async def on_pronunciation_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    if not query or not query.data or not update.effective_user:
+        return
+    if not query.data.startswith("r:"):
+        return
+    token = query.data[2:]
+    pending = _pending_pronunciation_get(token)
+    if pending is None:
+        await query.answer("This sample expired. Run /pronounce again.", show_alert=True)
+        return
+    if pending.user_id != update.effective_user.id:
+        await query.answer("Not your request.", show_alert=True)
+        return
+
+    await query.answer()
+    _pending_pronunciation_remove(token)
+    try:
+        added = add_literal_replacement(pending.from_text, pending.to_text)
+    except ValueError as e:
+        await query.edit_message_caption(caption=f"Failed to save: {e}")
+        return
+
+    path = config.TTS_REPLACEMENTS_FILE.resolve()
+    verb = "Added" if added else "Updated"
+    await query.edit_message_caption(
+        caption=(
+            f"{verb} in tts_replacements.json:\n"
+            f"  {pending.from_text!r} → {pending.to_text!r}\n"
+            f"File: {path}"
+        ),
+        reply_markup=None,
+    )
 
 
 async def on_article_action_callback(
@@ -790,7 +1086,7 @@ async def on_article_action_callback(
         pass
 
     if data == _CALLBACK_SPEAK:
-        await _run_speak(update, context)
+        _schedule_speak(update, context)
     else:
         await _run_save_to_disk(update, context)
 
@@ -805,7 +1101,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     text = update.message.text.strip()
     if is_speak_phrase(text):
-        await _handle_speak_request(update, context)
+        _schedule_speak(update, context)
         return
     if is_save_to_disk_phrase(text):
         await _handle_save_to_disk_request(update, context)
@@ -963,6 +1259,12 @@ async def _post_init(app: Application) -> None:
 
 
 async def _post_shutdown(app: Application) -> None:
+    speak_tasks: set[asyncio.Task] = app.bot_data.get("speak_tasks", set())
+    for task in list(speak_tasks):
+        task.cancel()
+    if speak_tasks:
+        await asyncio.gather(*speak_tasks, return_exceptions=True)
+
     client: httpx.AsyncClient = app.bot_data.get("http_client")
     if client:
         await client.aclose()
@@ -980,6 +1282,7 @@ def main() -> None:
     app = (
         Application.builder()
         .token(config.TELEGRAM_BOT_TOKEN)
+        .concurrent_updates(True)
         .post_init(_post_init)
         .post_shutdown(_post_shutdown)
         .build()
@@ -988,6 +1291,10 @@ def main() -> None:
     app.add_handler(CommandHandler("list_domains", cmd_list_domains))
     app.add_handler(CommandHandler("add_domain", cmd_add_domain))
     app.add_handler(CommandHandler("remove_domain", cmd_remove_domain))
+    app.add_handler(CommandHandler("fix_403", cmd_fix_403))
+    app.add_handler(CommandHandler("pronounce", cmd_pronounce))
+    app.add_handler(CommandHandler("add_pronunciation", cmd_add_pronunciation))
+    app.add_handler(CallbackQueryHandler(on_pronunciation_callback, pattern=r"^r:"))
     app.add_handler(CallbackQueryHandler(on_domain_add_callback, pattern=r"^[yn]:"))
     app.add_handler(CallbackQueryHandler(on_oversize_callback, pattern=r"^[px]:"))
     app.add_handler(CallbackQueryHandler(on_article_action_callback, pattern=r"^a:"))

@@ -130,10 +130,11 @@ async def playwright_fetch_html(
     )
     page = await context.new_page()
     try:
-        await page.goto(url, wait_until="load", timeout=timeout_ms)
+        await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        poll_ms = min(timeout_ms, 90_000)
         await page.wait_for_function(
             _PAGE_READY_JS,
-            timeout=min(timeout_ms, 45_000),
+            timeout=poll_ms,
         )
         final_url = page.url
         if not _final_url_allowed(final_url, allowed_domains, allow_http):

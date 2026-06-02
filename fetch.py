@@ -16,9 +16,20 @@ from domains_store import host_allowed
 class FetchError(Exception):
     """User-facing fetch failure."""
 
-    def __init__(self, message: str, *, rejected_url: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        rejected_url: str | None = None,
+        blocked_domain: str | None = None,
+        blocked_url: str | None = None,
+        tried_strategies: list[str] | None = None,
+    ) -> None:
         super().__init__(message)
         self.rejected_url = rejected_url
+        self.blocked_domain = blocked_domain
+        self.blocked_url = blocked_url
+        self.tried_strategies: list[str] = list(tried_strategies or [])
 
 
 @dataclass
@@ -134,49 +145,6 @@ def _ip_blocked(ip_str: str) -> bool:
     return False
 
 
-def _playwright_eligible(hostname: str | None) -> bool:
-    if not hostname or not config.PLAYWRIGHT_FALLBACK_DOMAINS:
-        return False
-    return host_allowed(hostname, set(config.PLAYWRIGHT_FALLBACK_DOMAINS))
-
-
-def _wordpress_api_eligible(hostname: str | None) -> bool:
-    if not hostname or not config.WORDPRESS_API_DOMAINS:
-        return False
-    return host_allowed(hostname, set(config.WORDPRESS_API_DOMAINS))
-
-
-async def _try_wordpress_api_fetch(
-    client: httpx.AsyncClient,
-    url: str,
-    byte_limit: int,
-    allowed_domains: set[str],
-) -> FetchOk | FetchOversizeKnown | None:
-    from fetch_wordpress import wordpress_fetch_html
-
-    result = await wordpress_fetch_html(
-        client,
-        url,
-        allowed_domains,
-        api_domains=set(config.WORDPRESS_API_DOMAINS),
-    )
-    if result is None:
-        return None
-    raw, final_url = result
-    n = len(raw)
-    if n > byte_limit:
-        return FetchOversizeKnown(
-            final_url=final_url,
-            content_length=n,
-            soft_limit=byte_limit,
-        )
-    return FetchOk(
-        content=raw,
-        final_url=final_url,
-        content_type="text/html; charset=utf-8",
-    )
-
-
 def validate_target_url(url: str, allowed_domains: set[str], allow_http: bool) -> None:
     parsed = urlparse(url)
     if not parsed.hostname:
@@ -241,47 +209,18 @@ async def fetch_url(
             if status < 200 or status >= 400:
                 await resp.aclose()
                 response_closed = True
-                if status == 403:
-                    hostname = urlparse(url).hostname
-                    if _wordpress_api_eligible(hostname):
-                        wp = await _try_wordpress_api_fetch(
-                            client, url, byte_limit, allowed_domains
-                        )
-                        if wp is not None:
-                            return wp
-                    if _playwright_eligible(hostname):
-                        try:
-                            from fetch_playwright import playwright_fetch_html
-                        except ImportError as e:
-                            raise FetchError(
-                                "HTTP 403 — site blocked the request (often Cloudflare). "
-                                "Install patchright: pip install patchright && patchright install chromium"
-                            ) from e
-                        try:
-                            raw, final_url, ct = await playwright_fetch_html(
-                                url,
-                                allowed_domains,
-                                allow_http=allow_http,
-                                user_agent=user_agent,
-                                timeout_ms=config.PLAYWRIGHT_TIMEOUT_MS,
-                            )
-                        except RuntimeError as e:
-                            raise FetchError(str(e)) from e
-                        except Exception as e:
-                            from fetch_playwright import close_playwright
+                if status in config.ANTIBOT_FALLBACK_STATUSES:
+                    from fetch_403 import try_antibot_fallbacks
 
-                            await close_playwright()
-                            raise FetchError(f"Browser fetch failed: {e}") from e
-                        n = len(raw)
-                        if n > byte_limit:
-                            return FetchOversizeKnown(
-                                final_url=final_url,
-                                content_length=n,
-                                soft_limit=byte_limit,
-                            )
-                        return FetchOk(
-                            content=raw, final_url=final_url, content_type=ct
-                        )
+                    return await try_antibot_fallbacks(
+                        client,
+                        url,
+                        byte_limit,
+                        allowed_domains,
+                        allow_http=allow_http,
+                        user_agent=user_agent,
+                        http_status=status,
+                    )
 
                 raise FetchError(f"HTTP {status}")
 

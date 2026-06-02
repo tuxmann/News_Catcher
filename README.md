@@ -198,11 +198,28 @@ print(normalize_for_tts("The Polish government and the U.S. envoy met."))
 
 Normalization runs on Telegram **speak**, overnight **briefing** audio, and `test_article_to_audio.py` (all use `synthesize_to_mp3` in `tts.py`).
 
+**Try spellings in Telegram** (writes to `tts_replacements.json`):
+
+```text
+/pronounce Polish Poleish Pole-ish
+```
+
+You get a short audio clip per spelling; tap **Save** on the one you want. Without audio:
+
+```text
+/add_pronunciation Polish Poleish
+```
+
+Article **speak** runs in the background — you can fetch the next URL while audio is generating.
+
 ### Commands
 
 - `/start` - intro/help
 - `/list_domains` - show approved domains
 - `/add_domain <domain>` or `/add_domain <PIN> <domain>` (if `ADMIN_PIN` is set)
+- `/fix_403 <domain>` — record a 403-blocked site and retry the last failed URL
+- `/pronounce <word> <alt1> [alt2…]` — hear pronunciation options and save to `tts_replacements.json`
+- `/add_pronunciation <from> <to>` — add a rule without generating samples
 - `/remove_domain <domain>` or `/remove_domain <PIN> <domain>` (if `ADMIN_PIN` is set)
 
 ## Security Model
@@ -227,17 +244,23 @@ If soft limit is exceeded, the bot prompts:
 
 Some sites (notably Economist) may return `HTTP 403` to plain HTTP clients.
 
-On `HTTP 403`, the bot tries fallbacks in order:
+On anti-bot HTTP responses (**402**, **403**, configurable), the bot tries fallbacks in order (for any **allowlisted** domain when `AUTO_403_FALLBACKS=1`, default):
 
-1. **WordPress REST API** for domains in `WORDPRESS_API_DOMAINS` (default: `marktechpost.com`) — no browser required.
-2. **Headless Chromium** (patchright) for domains in `PLAYWRIGHT_FALLBACK_DOMAINS`.
+1. **WordPress REST API** — domains in `WORDPRESS_API_DOMAINS` (default: `marktechpost.com`).
+2. **TLS impersonation** (`curl_cffi`) — works for Cloudflare (Politico) and Le Monde (402).
+3. **Headless Chromium** (patchright).
+
+If a new site returns 403, send the URL again; bypass runs automatically. If it still fails, use **`/fix_403 politico.com`** (or `/fix_403` right after the failed URL to retry).
 
 Config:
 
+- `ANTIBOT_FALLBACK_STATUSES` (default: `402,403`)
+- `AUTO_403_FALLBACKS` (default: `1`) — try curl_cffi + browser for all allowlisted domains
 - `WORDPRESS_API_DOMAINS` (default when omitted: `marktechpost.com`)
-- `PLAYWRIGHT_FALLBACK_DOMAINS` (default when omitted: `economist.com`, `marktechpost.com`)
+- `PLAYWRIGHT_FALLBACK_DOMAINS` (used when `AUTO_403_FALLBACKS=0`)
 - `PLAYWRIGHT_TIMEOUT_MS` (default: `60000`)
 - `PLAYWRIGHT_CHANNEL` (optional; defaults to `chrome` when `google-chrome` is installed)
+- `CURL_CFFI_IMPERSONATE` (default: `chrome131`)
 
 To disable fallback, set:
 

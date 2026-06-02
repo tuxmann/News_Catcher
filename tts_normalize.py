@@ -130,3 +130,54 @@ def clear_rules_cache() -> None:
     global _rules_cache, _rules_cache_path
     _rules_cache = None
     _rules_cache_path = None
+
+
+def _default_replacements_document() -> dict:
+    return {"replacements": [], "regex": []}
+
+
+def read_replacements_document(path: Path | None = None) -> dict:
+    """Load replacements JSON; return empty structure if missing."""
+    path = (path or config.TTS_REPLACEMENTS_FILE).resolve()
+    if not path.is_file():
+        return _default_replacements_document()
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path}: root must be a JSON object")
+    if "replacements" not in raw:
+        raw["replacements"] = []
+    if "regex" not in raw:
+        raw["regex"] = []
+    return raw
+
+
+def write_replacements_document(doc: dict, path: Path | None = None) -> Path:
+    path = (path or config.TTS_REPLACEMENTS_FILE).resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    clear_rules_cache()
+    return path
+
+
+def add_literal_replacement(from_str: str, to_str: str, *, path: Path | None = None) -> bool:
+    """
+    Append a literal replacement if not already present. Returns True if added.
+    """
+    src = from_str.strip()
+    dst = to_str.strip()
+    if not src or not dst:
+        raise ValueError("from and to must be non-empty")
+    doc = read_replacements_document(path)
+    replacements = doc.get("replacements", [])
+    if not isinstance(replacements, list):
+        replacements = []
+    for item in replacements:
+        if isinstance(item, dict) and item.get("from") == src:
+            item["to"] = dst
+            doc["replacements"] = replacements
+            write_replacements_document(doc, path)
+            return False
+    replacements.append({"from": src, "to": dst})
+    doc["replacements"] = replacements
+    write_replacements_document(doc, path)
+    return True

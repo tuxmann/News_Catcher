@@ -201,6 +201,22 @@ def synthesize_to_mp3(
     return output_path
 
 
+def pronunciation_sample_phrase(variant: str) -> str:
+    """Short line for auditioning how a spelling sounds."""
+    return f"The word is: {variant.strip()}."
+
+
+def synthesize_pronunciation_sample(variant: str, output_path: Path) -> Path:
+    """Synthesize a short MP3 for one spelling variant (for /pronounce)."""
+    phrase = pronunciation_sample_phrase(variant)
+    return synthesize_to_mp3(
+        phrase,
+        output_path,
+        title=None,
+        chunk_chars=300,
+    )
+
+
 def list_available_voices(model_name: str | None = None) -> list[str]:
     """Return friendly voice names for a KittenTTS model (loads model if needed)."""
     model_name = (model_name or config.TTS_MODEL).strip()

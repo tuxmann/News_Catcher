@@ -90,6 +90,25 @@ else:
     _wp_api_domains = [x.strip().lower() for x in _wp_api_raw.split(",") if x.strip()]
 WORDPRESS_API_DOMAINS: frozenset[str] = frozenset(_wp_api_domains)
 
+# Anti-bot bypass when plain HTTP returns these status codes (402 = Le Monde, 403 = Cloudflare, etc.).
+_ab_status_raw = os.environ.get("ANTIBOT_FALLBACK_STATUSES", "402,403")
+ANTIBOT_FALLBACK_STATUSES: frozenset[int] = frozenset(
+    int(x.strip()) for x in _ab_status_raw.split(",") if x.strip().isdigit()
+)
+
+# HTTP anti-bot bypass: try fallbacks for any allowlisted domain (not only named lists below).
+AUTO_403_FALLBACKS = _bool("AUTO_403_FALLBACKS", True)
+CURL_CFFI_ON_403 = _bool("CURL_CFFI_ON_403", True)
+BROWSER_ON_403 = _bool("BROWSER_ON_403", True)
+CURL_CFFI_IMPERSONATE = os.environ.get("CURL_CFFI_IMPERSONATE", "chrome131").strip()
+CURL_CFFI_TIMEOUT_SECONDS = _int("CURL_CFFI_TIMEOUT_SECONDS", 30)
+USE_RECORDED_403_FALLBACKS = _bool("USE_RECORDED_403_FALLBACKS", True)
+FALLBACK_DOMAINS_FILE = Path(
+    os.environ.get("FALLBACK_DOMAINS_FILE", "data/403_fallback_domains.json")
+)
+if not FALLBACK_DOMAINS_FILE.is_absolute():
+    FALLBACK_DOMAINS_FILE = PROJECT_ROOT / FALLBACK_DOMAINS_FILE
+
 # Phase 1: speak last article (TTS + Telegram audio)
 TTS_ENABLED = _bool("TTS_ENABLED", True)
 TTS_MODEL = os.environ.get("TTS_MODEL", "KittenML/kitten-tts-mini-0.8").strip()
