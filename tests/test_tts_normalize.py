@@ -30,6 +30,14 @@ class TestNormalizeForTts(unittest.TestCase):
         out = normalize_for_tts("The U.S. envoy arrived.", rules=rules, enabled=True)
         self.assertEqual(out, "The United States envoy arrived.")
 
+    def test_literal_case_insensitive(self) -> None:
+        rules = TtsReplacementRules(
+            literals=[("fox10phoenix", "fox ten fehnix")],
+            regex=[],
+        )
+        out = normalize_for_tts("From Fox10Phoenix dot com.", rules=rules, enabled=True)
+        self.assertEqual(out, "From fox ten fehnix dot com.")
+
     def test_longest_literal_first(self) -> None:
         rules = TtsReplacementRules(
             literals=[("U.S.", "United States"), ("U.S.A.", "United States of America")],

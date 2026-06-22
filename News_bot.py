@@ -7,7 +7,7 @@ import logging
 import re
 import secrets
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import httpx
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, MessageEntity, Update
 from telegram.error import TelegramError
@@ -21,6 +21,7 @@ from telegram.ext import (
 )
 
 import config
+from article_format import format_paragraphs_for_telegram
 from article_cache import load_last_article, purge_expired as purge_article_cache, save_last_article
 from article_export import is_save_to_disk_phrase, save_article_text_file
 from domains_store import (
@@ -38,6 +39,7 @@ from fetch import (
     FetchOversizeUnknown,
     fetch_url,
 )
+from pronunciation_suggest import suggest_pronunciations
 from tts import (
     is_speak_phrase,
     split_mp3_for_telegram,
@@ -105,6 +107,8 @@ _BOT_COMMAND_NAMES = frozenset(
         "fix_403",
         "pronounce",
         "add_pronunciation",
+        "fixaword",
+        "speak",
     }
 )
 
@@ -140,10 +144,26 @@ UNLISTED_SLASH_COMMAND = UnlistedSlashCommandFilter()
 PENDING_OVERSIZE: dict[str, "PendingOversize"] = {}
 PENDING_DOMAIN_ADD: dict[str, "PendingDomainAdd"] = {}
 PENDING_PRONUNCIATION: dict[str, "PendingPronunciation"] = {}
+PENDING_WORD_FIX: dict[int, "PendingWordFix"] = {}
+PENDING_SPEAK_PHRASE: dict[int, "PendingSpeakPhrase"] = {}
 
 # Inline actions after an article is delivered (callback_data must be <= 64 bytes).
 _CALLBACK_SPEAK = "a:speak"
 _CALLBACK_SAVE = "a:save"
+_CALLBACK_WORD_FIX = "a:wordfix"
+_CALLBACK_WORD_FIX_RETRY = "wf:retry"
+_CALLBACK_WORD_FIX_FEEDBACK = "wf:feedback"
+_CALLBACK_WORD_FIX_CUSTOM = "wf:custom"
+_CALLBACK_SPEAK_PHRASE = "s:phrase"
+
+WORD_FIX_HELP = (
+    "How fix-a-word works:\n"
+    "1. Reply with the word or phrase that sounds wrong in the audio.\n"
+    "2. Ollama suggests spellings — you'll get a short audio clip for each.\n"
+    "3. Tap Save on the sample you like (writes to tts_replacements.json).\n"
+    "4. Not happy? Tap Retry, Send feedback, or My spelling to try your own.\n\n"
+    "Example words: Polish, U.S., a.m., Mesa"
+)
 
 
 @dataclass
@@ -169,6 +189,27 @@ class PendingDomainAdd:
     expires_monotonic: float
 
 
+@dataclass
+class PendingWordFix:
+    """Word-fix session: awaiting word, feedback, or follow-up after samples."""
+
+    user_id: int
+    article_title: str | None
+    article_text: str | None
+    from_text: str | None = None
+    tried_spellings: list[str] = field(default_factory=list)
+    step: str = "awaiting_word"
+    expires_monotonic: float = 0.0
+
+
+@dataclass
+class PendingSpeakPhrase:
+    """Waiting for a test sentence after tapping Test phrase."""
+
+    user_id: int
+    expires_monotonic: float
+
+
 def _allowed_user(user_id: int) -> bool:
     if not config.ALLOWED_TELEGRAM_USER_IDS:
         return False
@@ -181,8 +222,62 @@ def _article_actions_keyboard() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton("Speak to me", callback_data=_CALLBACK_SPEAK),
                 InlineKeyboardButton("Save to disk", callback_data=_CALLBACK_SAVE),
-            ]
+            ],
         ]
+    )
+
+
+def _word_fix_followup_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Retry", callback_data=_CALLBACK_WORD_FIX_RETRY),
+                InlineKeyboardButton("Send feedback", callback_data=_CALLBACK_WORD_FIX_FEEDBACK),
+            ],
+            [
+                InlineKeyboardButton("My spelling", callback_data=_CALLBACK_WORD_FIX_CUSTOM),
+            ],
+        ]
+    )
+
+
+async def _send_word_fix_followup(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    user_id: int,
+    article_title: str | None,
+    article_text: str | None,
+    from_text: str,
+    tried_spellings: list[str],
+    message: str = (
+        "Tap Save on a sample you like, or use the buttons below for more options."
+    ),
+) -> None:
+    _pending_word_fix_put(
+        user_id,
+        article_title,
+        article_text,
+        from_text=from_text,
+        tried_spellings=tried_spellings,
+        step="after_samples",
+    )
+    await context.bot.send_message(
+        chat_id,
+        message,
+        reply_markup=_word_fix_followup_keyboard(),
+    )
+
+
+def _after_audio_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Fix a word", callback_data=_CALLBACK_WORD_FIX)]]
+    )
+
+
+def _speak_phrase_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Test phrase", callback_data=_CALLBACK_SPEAK_PHRASE)]]
     )
 
 
@@ -401,6 +496,12 @@ def _purge_expired_pending() -> None:
     dead_p = [k for k, v in PENDING_PRONUNCIATION.items() if now > v.expires_monotonic]
     for k in dead_p:
         del PENDING_PRONUNCIATION[k]
+    expired_users = [uid for uid, v in PENDING_WORD_FIX.items() if now > v.expires_monotonic]
+    for uid in expired_users:
+        del PENDING_WORD_FIX[uid]
+    expired_speak = [uid for uid, v in PENDING_SPEAK_PHRASE.items() if now > v.expires_monotonic]
+    for uid in expired_speak:
+        del PENDING_SPEAK_PHRASE[uid]
 
 
 def _pending_pronunciation_put(
@@ -428,6 +529,88 @@ def _pending_pronunciation_get(token: str) -> PendingPronunciation | None:
 
 def _pending_pronunciation_remove(token: str) -> None:
     PENDING_PRONUNCIATION.pop(token, None)
+
+
+def _pending_word_fix_put(
+    user_id: int,
+    article_title: str | None,
+    article_text: str | None,
+    *,
+    from_text: str | None = None,
+    tried_spellings: list[str] | None = None,
+    step: str = "awaiting_word",
+) -> None:
+    existing = PENDING_WORD_FIX.get(user_id)
+    PENDING_WORD_FIX[user_id] = PendingWordFix(
+        user_id=user_id,
+        article_title=article_title,
+        article_text=article_text,
+        from_text=from_text,
+        tried_spellings=(
+            list(tried_spellings)
+            if tried_spellings is not None
+            else (list(existing.tried_spellings) if existing else [])
+        ),
+        step=step,
+        expires_monotonic=time.monotonic() + config.PENDING_OVERSIZE_TTL,
+    )
+
+
+def _pending_word_fix_get(user_id: int) -> PendingWordFix | None:
+    pending = PENDING_WORD_FIX.get(user_id)
+    if pending is None:
+        return None
+    if time.monotonic() > pending.expires_monotonic:
+        del PENDING_WORD_FIX[user_id]
+        return None
+    return pending
+
+
+def _pending_word_fix_clear(user_id: int) -> None:
+    PENDING_WORD_FIX.pop(user_id, None)
+
+
+def _pending_word_fix_pop(user_id: int) -> PendingWordFix | None:
+    pending = _pending_word_fix_get(user_id)
+    if pending is not None:
+        del PENDING_WORD_FIX[user_id]
+    return pending
+
+
+def _pending_speak_phrase_put(user_id: int) -> None:
+    PENDING_SPEAK_PHRASE[user_id] = PendingSpeakPhrase(
+        user_id=user_id,
+        expires_monotonic=time.monotonic() + config.PENDING_OVERSIZE_TTL,
+    )
+
+
+def _pending_speak_phrase_get(user_id: int) -> PendingSpeakPhrase | None:
+    pending = PENDING_SPEAK_PHRASE.get(user_id)
+    if pending is None:
+        return None
+    if time.monotonic() > pending.expires_monotonic:
+        del PENDING_SPEAK_PHRASE[user_id]
+        return None
+    return pending
+
+
+def _pending_speak_phrase_clear(user_id: int) -> None:
+    PENDING_SPEAK_PHRASE.pop(user_id, None)
+
+
+def _article_context_snippet(title: str | None, text: str, word: str) -> str:
+    """Short context for Ollama disambiguation."""
+    parts: list[str] = []
+    if title:
+        parts.append(f"Title: {title}")
+    needle = word.casefold()
+    for para in re.split(r"\n\s*\n+", text):
+        if needle in para.casefold():
+            parts.append(para.strip()[:500])
+            break
+    else:
+        parts.append(text.strip()[:400])
+    return "\n".join(parts)
 
 
 def _pending_get(token: str) -> PendingOversize | None:
@@ -502,8 +685,14 @@ async def _process_fetched_html(
         header_parts.append(f"Date: {article.date}")
     await context.bot.send_message(chat_id, "\n".join(header_parts))
 
-    for msg in _format_article_chunks(article.text, config.TELEGRAM_CHUNK_CHARS):
-        await context.bot.send_message(chat_id, msg)
+    for msg in _format_article_chunks(
+        format_paragraphs_for_telegram(article.text),
+        config.TELEGRAM_CHUNK_CHARS,
+    ):
+        try:
+            await context.bot.send_message(chat_id, msg, parse_mode="HTML")
+        except TelegramError:
+            await context.bot.send_message(chat_id, msg)
 
     if update.effective_user:
         save_last_article(
@@ -533,6 +722,71 @@ async def _process_fetched_html(
         )
 
 
+async def _start_word_fix_prompt(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    user_id: int,
+    chat_id: int,
+) -> None:
+    cached = load_last_article(
+        config.ARTICLE_CACHE_DIR,
+        user_id,
+        ttl_seconds=config.LAST_ARTICLE_TTL_SECONDS,
+    )
+    _pending_word_fix_put(
+        user_id,
+        cached.title if cached else None,
+        cached.text if cached else None,
+    )
+    await context.bot.send_message(chat_id, WORD_FIX_HELP)
+    await context.bot.send_message(
+        chat_id,
+        "Reply with the word or short phrase that sounds wrong in the audio.",
+    )
+
+
+async def cmd_fixaword(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not _allowed_user(update.effective_user.id):
+        await update.message.reply_text("You are not authorized.")
+        return
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if chat_id is None:
+        return
+    await _start_word_fix_prompt(
+        context,
+        user_id=update.effective_user.id,
+        chat_id=chat_id,
+    )
+
+
+async def cmd_speak(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Speak a single test phrase with current pronunciation rules."""
+    if not update.effective_user or not update.message:
+        return
+    if not _allowed_user(update.effective_user.id):
+        await update.message.reply_text("You are not authorized.")
+        return
+    if not config.TTS_ENABLED:
+        await update.message.reply_text("Text-to-speech is disabled on this bot.")
+        return
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "Usage: /speak <sentence or phrase>\n\n"
+            "Example:\n"
+            "  /speak The train arrives at 5 a.m.\n"
+            "  /speak Mesa police responded at 5 a.m. Sunday.\n\n"
+            "Uses your saved pronunciations from tts_replacements.json."
+        )
+        return
+
+    phrase = " ".join(args).strip()
+    await _run_speak_phrase(update, context, phrase)
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.message:
         return
@@ -544,9 +798,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "I will fetch and return readable text.\n\n"
         "If the site is not on your list yet, I will ask whether to add its domain.\n\n"
         "After each article you can tap Speak to me or Save to disk, "
-        "or type those phrases.\n\n"
+        "or type those phrases.\n"
+        "After audio is ready, tap Fix a word or send /fixaword to tune pronunciation.\n\n"
         "Commands: /list_domains, /add_domain, /remove_domain, /fix_403\n"
-        "TTS: /pronounce <word> <alt1> [alt2…] — hear spellings and save to tts_replacements.json\n"
+        "TTS: /speak <phrase> — hear one sentence with current pronunciations\n"
+        "     /fixaword — reply with a word to fix; /pronounce <word> [alt1 …]\n"
         "     /add_pronunciation <from> <to> — add a rule without audio preview"
     )
 
@@ -840,6 +1096,65 @@ def _schedule_speak(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     task.add_done_callback(_done)
 
 
+async def _run_speak_phrase(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    phrase: str,
+) -> None:
+    """Synthesize and send a short test clip (no intro/outro branding)."""
+    if not update.effective_user:
+        return
+    phrase = phrase.strip()
+    if not phrase:
+        return
+
+    chat_id = _action_chat_id(update)
+    user_id = update.effective_user.id
+    if chat_id is None:
+        return
+
+    if not config.TTS_ENABLED:
+        await _bot_send_text(
+            update, context, "Text-to-speech is disabled on this bot.", chat_id=chat_id
+        )
+        return
+
+    await _bot_send_text(update, context, "Generating test audio…", chat_id=chat_id)
+    await context.bot.send_chat_action(chat_id=chat_id, action="upload_audio")
+
+    config.AUDIO_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = config.AUDIO_OUTPUT_DIR / f"speak_test_{user_id}_{int(time.time())}.mp3"
+
+    try:
+        await asyncio.to_thread(
+            synthesize_to_mp3,
+            phrase,
+            out_path,
+            title=None,
+            source_domain=None,
+            chunk_chars=1000,
+            lead_silence_ms=0,
+        )
+    except Exception as e:
+        logger.exception("speak phrase TTS failed")
+        await _bot_send_text(update, context, f"Could not generate audio: {e}", chat_id=chat_id)
+        return
+
+    title = phrase[:64]
+    try:
+        with out_path.open("rb") as audio_file:
+            await context.bot.send_audio(
+                chat_id,
+                audio=audio_file,
+                title=title,
+                performer="News Catcher",
+            )
+    except TelegramError as e:
+        await _bot_send_text(update, context, f"Could not send audio: {e}", chat_id=chat_id)
+    finally:
+        out_path.unlink(missing_ok=True)
+
+
 async def _run_speak(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user:
         return
@@ -887,6 +1202,7 @@ async def _run_speak(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             cached.text,
             out_path,
             title=cached.title,
+            source_domain=registrable_domain_from_url(cached.url),
         )
     except Exception as e:
         logger.exception("TTS failed")
@@ -910,6 +1226,12 @@ async def _run_speak(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             await _bot_send_text(update, context, f"Could not send audio: {e}", chat_id=chat_id)
             return
 
+    await context.bot.send_message(
+        chat_id,
+        "Anything sound wrong? Tap Fix a word to tune pronunciation.",
+        reply_markup=_after_audio_keyboard(),
+    )
+
 
 async def _handle_save_to_disk_request(
     update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -917,72 +1239,51 @@ async def _handle_save_to_disk_request(
     await _run_save_to_disk(update, context)
 
 
-async def cmd_add_pronunciation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.message:
-        return
-    if not _allowed_user(update.effective_user.id):
-        await update.message.reply_text("You are not authorized.")
-        return
-    args = context.args or []
-    if len(args) < 2:
-        await update.message.reply_text(
-            "Usage: /add_pronunciation <from> <to>\n"
-            "Example: /add_pronunciation U.S. United States\n"
-            "Example: /add_pronunciation Polish Poleish"
-        )
-        return
-    from_text = args[0]
-    to_text = " ".join(args[1:])
-    try:
-        added = add_literal_replacement(from_text, to_text)
-    except ValueError as e:
-        await update.message.reply_text(str(e))
-        return
-    path = config.TTS_REPLACEMENTS_FILE.resolve()
-    if added:
-        await update.message.reply_text(
-            f"Added pronunciation rule:\n  {from_text!r} → {to_text!r}\n\nSaved to {path}"
-        )
-    else:
-        await update.message.reply_text(
-            f"Updated existing rule:\n  {from_text!r} → {to_text!r}\n\nSaved to {path}"
-        )
+async def _resolve_pronunciation_alternatives(
+    from_text: str,
+    alternatives: list[str],
+    *,
+    article_context: str | None = None,
+    user_feedback: str | None = None,
+    avoid_spellings: list[str] | None = None,
+) -> tuple[list[str], str | None, str | None]:
+    """Use explicit alts, or ask Ollama. Returns (alts, warning, error)."""
+    alts = [a.strip() for a in alternatives if a.strip()]
+    if alts:
+        return alts, None, None
+    if not config.PRONUNCIATION_SUGGEST_ENABLED:
+        return [], None, "Pronunciation suggestions are disabled (PRONUNCIATION_SUGGEST_ENABLED=0)."
+    result = await asyncio.to_thread(
+        suggest_pronunciations,
+        from_text,
+        article_context=article_context,
+        user_feedback=user_feedback,
+        avoid_spellings=avoid_spellings,
+    )
+    return result.suggestions, result.warning, result.error
 
 
-async def cmd_pronounce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Generate short audio samples for spelling alternatives; save via inline button."""
-    if not update.effective_user or not update.message:
-        return
-    if not _allowed_user(update.effective_user.id):
-        await update.message.reply_text("You are not authorized.")
-        return
-    if not config.TTS_ENABLED:
-        await update.message.reply_text("Text-to-speech is disabled on this bot.")
-        return
-
-    args = context.args or []
-    if len(args) < 2:
-        await update.message.reply_text(
-            "Usage: /pronounce <word-in-article> <how-to-say-it> [<alt2> …]\n\n"
-            "Example:\n"
-            "  /pronounce Polish Poleish Pole-ish\n\n"
-            "You will get a short audio clip for each spelling. Tap Save on the one "
-            "you want added to tts_replacements.json.\n\n"
-            "To add without listening: /add_pronunciation Polish Poleish"
+async def _send_pronunciation_samples(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    user_id: int,
+    from_text: str,
+    alternatives: list[str],
+) -> None:
+    if not alternatives:
+        await context.bot.send_message(
+            chat_id,
+            f"No pronunciation suggestions for {from_text!r}. "
+            "Try /pronounce with spellings, or check that Ollama is running.",
         )
         return
 
-    from_text = args[0]
-    alternatives = args[1:]
-    chat_id = update.effective_chat.id if update.effective_chat else None
-    if chat_id is None:
-        return
-
-    await update.message.reply_text(
-        f"Generating {len(alternatives)} pronunciation sample(s) for {from_text!r}…"
+    await context.bot.send_message(
+        chat_id,
+        f"Generating {len(alternatives)} sample(s) for {from_text!r}…",
     )
     config.AUDIO_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    user_id = update.effective_user.id
 
     for alt in alternatives:
         token = _pending_pronunciation_put(user_id, from_text, alt)
@@ -1016,8 +1317,8 @@ async def cmd_pronounce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                     title=f"Pronounce: {alt}",
                     caption=(
                         f"Hear how {alt!r} sounds.\n"
-                        f"If you like it, tap Save to write "
-                        f"{from_text!r} → {alt!r} in tts_replacements.json."
+                        f"Tap Save to write {from_text!r} → {alt!r} "
+                        f"in tts_replacements.json."
                     ),
                     reply_markup=keyboard,
                 )
@@ -1025,6 +1326,224 @@ async def cmd_pronounce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await context.bot.send_message(chat_id, f"Could not send sample for {alt!r}: {e}")
         finally:
             out_path.unlink(missing_ok=True)
+
+
+async def _run_word_fix_for_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    from_text: str,
+    article_context: str | None,
+    article_title: str | None = None,
+    article_text: str | None = None,
+    user_feedback: str | None = None,
+    avoid_spellings: list[str] | None = None,
+    show_followup: bool = True,
+) -> None:
+    chat_id = _action_chat_id(update)
+    user_id = update.effective_user.id if update.effective_user else None
+    if chat_id is None or user_id is None:
+        return
+
+    if not config.TTS_ENABLED:
+        await _bot_send_text(
+            update, context, "Text-to-speech is disabled on this bot.", chat_id=chat_id
+        )
+        return
+
+    if user_feedback:
+        await _bot_send_text(
+            update,
+            context,
+            "Sending your feedback to Ollama and generating new samples…",
+            chat_id=chat_id,
+        )
+    elif not avoid_spellings:
+        await _bot_send_text(
+            update,
+            context,
+            f"Asking Ollama for pronunciation ideas for {from_text!r}…",
+            chat_id=chat_id,
+        )
+    else:
+        await _bot_send_text(
+            update,
+            context,
+            f"Retrying with new spelling ideas for {from_text!r}…",
+            chat_id=chat_id,
+        )
+
+    alternatives, ollama_warning, ollama_error = await _resolve_pronunciation_alternatives(
+        from_text,
+        [],
+        article_context=article_context,
+        user_feedback=user_feedback,
+        avoid_spellings=avoid_spellings,
+    )
+    if ollama_warning:
+        await _bot_send_text(update, context, ollama_warning, chat_id=chat_id)
+    if ollama_error:
+        await _bot_send_text(update, context, ollama_error, chat_id=chat_id)
+        if show_followup:
+            await _send_word_fix_followup(
+                context,
+                chat_id=chat_id,
+                user_id=user_id,
+                article_title=article_title,
+                article_text=article_text,
+                from_text=from_text,
+                tried_spellings=list(avoid_spellings or []),
+                message=(
+                    f"Ollama had no ideas for {from_text!r}. "
+                    "Tap My spelling to try your own, or Retry / Send feedback."
+                ),
+            )
+        return
+    if not alternatives:
+        if show_followup:
+            await _send_word_fix_followup(
+                context,
+                chat_id=chat_id,
+                user_id=user_id,
+                article_title=article_title,
+                article_text=article_text,
+                from_text=from_text,
+                tried_spellings=list(avoid_spellings or []),
+                message=(
+                    f"No new Ollama suggestions for {from_text!r}. "
+                    "Tap My spelling to try your own."
+                ),
+            )
+        return
+
+    tried = list(avoid_spellings or [])
+    for alt in alternatives:
+        if alt not in tried:
+            tried.append(alt)
+
+    await _send_pronunciation_samples(
+        context,
+        chat_id=chat_id,
+        user_id=user_id,
+        from_text=from_text,
+        alternatives=alternatives,
+    )
+
+    if show_followup:
+        await _send_word_fix_followup(
+            context,
+            chat_id=chat_id,
+            user_id=user_id,
+            article_title=article_title,
+            article_text=article_text,
+            from_text=from_text,
+            tried_spellings=tried,
+        )
+
+
+async def cmd_add_pronunciation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not _allowed_user(update.effective_user.id):
+        await update.message.reply_text("You are not authorized.")
+        return
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Usage: /add_pronunciation <from> <to>\n"
+            "Example: /add_pronunciation U.S. United States\n"
+            "Example: /add_pronunciation Polish Poleish"
+        )
+        return
+    from_text = args[0]
+    to_text = " ".join(args[1:])
+    try:
+        added = add_literal_replacement(from_text, to_text)
+    except ValueError as e:
+        await update.message.reply_text(str(e))
+        return
+    path = config.TTS_REPLACEMENTS_FILE.resolve()
+    if added:
+        await update.message.reply_text(
+            f"Added pronunciation rule:\n  {from_text!r} → {to_text!r}\n\nSaved to {path}",
+            reply_markup=_speak_phrase_keyboard(),
+        )
+    else:
+        await update.message.reply_text(
+            f"Updated existing rule:\n  {from_text!r} → {to_text!r}\n\nSaved to {path}",
+            reply_markup=_speak_phrase_keyboard(),
+        )
+
+
+async def cmd_pronounce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Generate short audio samples for spelling alternatives; save via inline button."""
+    if not update.effective_user or not update.message:
+        return
+    if not _allowed_user(update.effective_user.id):
+        await update.message.reply_text("You are not authorized.")
+        return
+    if not config.TTS_ENABLED:
+        await update.message.reply_text("Text-to-speech is disabled on this bot.")
+        return
+
+    args = context.args or []
+    if len(args) < 1:
+        await update.message.reply_text(
+            "Usage: /pronounce <word-in-article> [<how-to-say-it> …]\n\n"
+            "With one word, Ollama suggests spellings to try.\n"
+            "Example:\n"
+            "  /pronounce Polish\n"
+            "  /pronounce Polish Poleish Pole-ish\n\n"
+            "You get a short audio clip per spelling. Tap Save on the one you want.\n\n"
+            "Or tap Fix a word after audio is sent, or use /add_pronunciation to skip audio."
+        )
+        return
+
+    from_text = args[0]
+    alternatives = args[1:]
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if chat_id is None:
+        return
+
+    article_context: str | None = None
+    if len(alternatives) == 0:
+        cached = load_last_article(
+            config.ARTICLE_CACHE_DIR,
+            update.effective_user.id,
+            ttl_seconds=config.LAST_ARTICLE_TTL_SECONDS,
+        )
+        if cached:
+            article_context = _article_context_snippet(cached.title, cached.text, from_text)
+
+    if not alternatives and config.PRONUNCIATION_SUGGEST_ENABLED:
+        await update.message.reply_text(
+            f"Asking Ollama for pronunciation ideas for {from_text!r}…"
+        )
+
+    resolved, ollama_warning, ollama_error = await _resolve_pronunciation_alternatives(
+        from_text,
+        alternatives,
+        article_context=article_context,
+    )
+    if ollama_warning:
+        await update.message.reply_text(ollama_warning)
+    if ollama_error:
+        await update.message.reply_text(ollama_error)
+        return
+    if not resolved:
+        await update.message.reply_text(
+            f"No suggestions for {from_text!r}. "
+            f"Add spellings: /pronounce {from_text} your-spelling"
+        )
+        return
+
+    await _send_pronunciation_samples(
+        context,
+        chat_id=chat_id,
+        user_id=update.effective_user.id,
+        from_text=from_text,
+        alternatives=resolved,
+    )
 
 
 async def on_pronunciation_callback(
@@ -1058,9 +1577,126 @@ async def on_pronunciation_callback(
         caption=(
             f"{verb} in tts_replacements.json:\n"
             f"  {pending.from_text!r} → {pending.to_text!r}\n"
-            f"File: {path}"
+            f"File: {path}\n\n"
+            "Tap Test phrase or send /speak <sentence> to hear it spoken."
         ),
-        reply_markup=None,
+        reply_markup=_speak_phrase_keyboard(),
+    )
+
+
+async def on_speak_phrase_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    if not query or not query.data or not update.effective_user:
+        return
+    if not _allowed_user(update.effective_user.id):
+        await query.answer("Not authorized.", show_alert=True)
+        return
+    if query.data != _CALLBACK_SPEAK_PHRASE:
+        return
+
+    await query.answer()
+    chat_id = _action_chat_id(update)
+    if chat_id is None:
+        return
+
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except TelegramError:
+        pass
+
+    _pending_speak_phrase_put(update.effective_user.id)
+    await context.bot.send_message(
+        chat_id,
+        "Reply with a sentence to test, or send:\n"
+        "/speak The train arrives at 5 a.m.",
+    )
+
+
+async def on_word_fix_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    if not query or not query.data or not update.effective_user:
+        return
+    if not _allowed_user(update.effective_user.id):
+        await query.answer("Not authorized.", show_alert=True)
+        return
+
+    data = query.data
+    if data not in (
+        _CALLBACK_WORD_FIX_RETRY,
+        _CALLBACK_WORD_FIX_FEEDBACK,
+        _CALLBACK_WORD_FIX_CUSTOM,
+    ):
+        return
+
+    user_id = update.effective_user.id
+    pending = _pending_word_fix_get(user_id)
+    if pending is None or not pending.from_text:
+        await query.answer("Session expired. Send /fixaword to start again.", show_alert=True)
+        return
+
+    await query.answer()
+    chat_id = _action_chat_id(update)
+    if chat_id is None:
+        return
+
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except TelegramError:
+        pass
+
+    if data == _CALLBACK_WORD_FIX_FEEDBACK:
+        _pending_word_fix_put(
+            user_id,
+            pending.article_title,
+            pending.article_text,
+            from_text=pending.from_text,
+            tried_spellings=pending.tried_spellings,
+            step="awaiting_feedback",
+        )
+        await context.bot.send_message(
+            chat_id,
+            f"Tell Ollama what sounded wrong with the samples for {pending.from_text!r}, "
+            "and what kind of spelling to try.\n\n"
+            "Example: \"Too robotic — try something that sounds like the country, not the adjective.\"",
+        )
+        return
+
+    if data == _CALLBACK_WORD_FIX_CUSTOM:
+        _pending_word_fix_put(
+            user_id,
+            pending.article_title,
+            pending.article_text,
+            from_text=pending.from_text,
+            tried_spellings=pending.tried_spellings,
+            step="awaiting_custom_spelling",
+        )
+        await context.bot.send_message(
+            chat_id,
+            f"Reply with how you want {pending.from_text!r} to sound when read aloud.\n\n"
+            "Examples:\n"
+            "  a.m. → ay em\n"
+            "  U.S. → United States\n"
+            "  Polish → Poleish",
+        )
+        return
+
+    article_context = _article_context_snippet(
+        pending.article_title,
+        pending.article_text or "",
+        pending.from_text,
+    )
+    await _run_word_fix_for_text(
+        update,
+        context,
+        from_text=pending.from_text,
+        article_context=article_context,
+        article_title=pending.article_title,
+        article_text=pending.article_text,
+        avoid_spellings=pending.tried_spellings,
     )
 
 
@@ -1075,7 +1711,7 @@ async def on_article_action_callback(
         return
 
     data = query.data
-    if data not in (_CALLBACK_SPEAK, _CALLBACK_SAVE):
+    if data not in (_CALLBACK_SPEAK, _CALLBACK_SAVE, _CALLBACK_WORD_FIX):
         await query.answer()
         return
 
@@ -1087,8 +1723,14 @@ async def on_article_action_callback(
 
     if data == _CALLBACK_SPEAK:
         _schedule_speak(update, context)
-    else:
+    elif data == _CALLBACK_SAVE:
         await _run_save_to_disk(update, context)
+    elif data == _CALLBACK_WORD_FIX:
+        user_id = update.effective_user.id
+        chat_id = _action_chat_id(update)
+        if chat_id is None:
+            return
+        await _start_word_fix_prompt(context, user_id=user_id, chat_id=chat_id)
 
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1107,10 +1749,122 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await _handle_save_to_disk_request(update, context)
         return
 
+    user_id = update.effective_user.id
+    pending_speak = _pending_speak_phrase_get(user_id)
+    if pending_speak is not None:
+        if text.startswith("/") and not text.lower().startswith("/speak"):
+            await update.message.reply_text(
+                "Waiting for a test sentence. Reply with plain text or /speak <phrase>."
+            )
+            return
+        phrase = text
+        if text.lower().startswith("/speak"):
+            parts = text.split(None, 1)
+            phrase = parts[1].strip() if len(parts) > 1 else ""
+        if not phrase:
+            await update.message.reply_text(
+                "Send a sentence to test, e.g.\n/speak The meeting starts at 5 a.m."
+            )
+            return
+        _pending_speak_phrase_clear(user_id)
+        await _run_speak_phrase(update, context, phrase)
+        return
+
+    pending_word = _pending_word_fix_get(user_id)
+    if pending_word is not None:
+        if pending_word.step == "awaiting_feedback":
+            if not text or text.startswith("/"):
+                await update.message.reply_text(
+                    "Send plain-text feedback for Ollama (what sounded wrong, what to try)."
+                )
+                return
+            if not pending_word.from_text:
+                _pending_word_fix_clear(user_id)
+                return
+            article_context = _article_context_snippet(
+                pending_word.article_title,
+                pending_word.article_text or "",
+                pending_word.from_text,
+            )
+            await _run_word_fix_for_text(
+                update,
+                context,
+                from_text=pending_word.from_text,
+                article_context=article_context,
+                article_title=pending_word.article_title,
+                article_text=pending_word.article_text,
+                user_feedback=text,
+                avoid_spellings=pending_word.tried_spellings,
+            )
+            return
+
+        if pending_word.step == "awaiting_custom_spelling":
+            spelling = text.strip()
+            if not spelling or spelling.startswith("/"):
+                await update.message.reply_text(
+                    "Send your spelling as plain text (e.g. ay em for a.m.)."
+                )
+                return
+            if not pending_word.from_text:
+                _pending_word_fix_clear(user_id)
+                return
+            tried = list(pending_word.tried_spellings)
+            if spelling not in tried:
+                tried.append(spelling)
+            await _send_pronunciation_samples(
+                context,
+                chat_id=update.effective_chat.id,
+                user_id=user_id,
+                from_text=pending_word.from_text,
+                alternatives=[spelling],
+            )
+            await _send_word_fix_followup(
+                context,
+                chat_id=update.effective_chat.id,
+                user_id=user_id,
+                article_title=pending_word.article_title,
+                article_text=pending_word.article_text,
+                from_text=pending_word.from_text,
+                tried_spellings=tried,
+                message=f"Your spelling for {pending_word.from_text!r}. Tap Save if it sounds right.",
+            )
+            return
+
+        if pending_word.step == "after_samples":
+            await update.message.reply_text(
+                "Tap Retry, Send feedback, or My spelling on the message above, "
+                "or send /fixaword to start over."
+            )
+            return
+
+        if pending_word.step == "awaiting_word":
+            word = text.strip()
+            if not word or word.startswith("/"):
+                await update.message.reply_text(
+                    "Send the word or phrase to fix (plain text, not a command)."
+                )
+                return
+            article_context = _article_context_snippet(
+                pending_word.article_title,
+                pending_word.article_text or "",
+                word,
+            )
+            await _run_word_fix_for_text(
+                update,
+                context,
+                from_text=word,
+                article_context=article_context,
+                article_title=pending_word.article_title,
+                article_text=pending_word.article_text,
+            )
+            return
+
     url = _extract_first_url(text)
     if not url:
         return
 
+    _pending_word_fix_clear(user_id)
+    _pending_speak_phrase_clear(user_id)
     await _deliver_user_url_fetch(update, context, url, offer_domain_prompt=True)
 
 
@@ -1294,7 +2048,11 @@ def main() -> None:
     app.add_handler(CommandHandler("fix_403", cmd_fix_403))
     app.add_handler(CommandHandler("pronounce", cmd_pronounce))
     app.add_handler(CommandHandler("add_pronunciation", cmd_add_pronunciation))
+    app.add_handler(CommandHandler("fixaword", cmd_fixaword))
+    app.add_handler(CommandHandler("speak", cmd_speak))
     app.add_handler(CallbackQueryHandler(on_pronunciation_callback, pattern=r"^r:"))
+    app.add_handler(CallbackQueryHandler(on_speak_phrase_callback, pattern=r"^s:"))
+    app.add_handler(CallbackQueryHandler(on_word_fix_callback, pattern=r"^wf:"))
     app.add_handler(CallbackQueryHandler(on_domain_add_callback, pattern=r"^[yn]:"))
     app.add_handler(CallbackQueryHandler(on_oversize_callback, pattern=r"^[px]:"))
     app.add_handler(CallbackQueryHandler(on_article_action_callback, pattern=r"^a:"))

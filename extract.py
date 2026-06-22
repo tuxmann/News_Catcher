@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass
 from urllib.parse import urljoin
 
+from article_format import deduplicate_article_text, strip_link_only_paragraphs
 import trafilatura
 from lxml import html
 from readability import Document
@@ -197,6 +198,8 @@ def extract_article(html_bytes: bytes, source_url: str) -> ExtractedArticle:
     if text and text.strip():
         text = normalize_paragraph_spacing(text)
         text = strip_newsletter_signup_paragraphs(text)
+        text = strip_link_only_paragraphs(text)
+        text = deduplicate_article_text(text, title=title)
         return ExtractedArticle(
             title=title,
             author=author,
@@ -210,10 +213,13 @@ def extract_article(html_bytes: bytes, source_url: str) -> ExtractedArticle:
     fallback_text = _readability_paragraph_text(summary_html)
     fallback_text = normalize_paragraph_spacing(fallback_text)
     fallback_text = strip_newsletter_signup_paragraphs(fallback_text)
+    fallback_text = strip_link_only_paragraphs(fallback_text)
     summary_title = doc.title()
+    final_title = summary_title or title
+    fallback_text = deduplicate_article_text(fallback_text, title=final_title)
 
     return ExtractedArticle(
-        title=summary_title or title,
+        title=final_title,
         author=author,
         date=date,
         text=fallback_text,

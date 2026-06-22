@@ -69,6 +69,17 @@ class TestParagraphPreservation(unittest.TestCase):
         article = extract_article(html, "https://www.reuters.com/world/example/")
         self.assertIn("Sign up here", article.text)
 
+    def test_removes_link_only_paragraph(self) -> None:
+        html = b"""<html><body><article>
+<p>Real body.</p>
+<p>https://www.example.com/related-article</p>
+<p>More body.</p>
+</article></body></html>"""
+        article = extract_article(html, "https://www.reuters.com/world/example/")
+        self.assertIn("Real body", article.text)
+        self.assertIn("More body", article.text)
+        self.assertNotIn("related-article", article.text)
+
     def test_trafilatura_keeps_blank_lines_between_p_tags(self) -> None:
         html = b"""<html><body><article>
 <p>First paragraph here.</p>

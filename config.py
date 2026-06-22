@@ -118,6 +118,19 @@ TTS_NORMALIZE_ENABLED = _bool("TTS_NORMALIZE_ENABLED", True)
 TTS_REPLACEMENTS_FILE = Path(os.environ.get("TTS_REPLACEMENTS_FILE", "tts_replacements.json"))
 if not TTS_REPLACEMENTS_FILE.is_absolute():
     TTS_REPLACEMENTS_FILE = PROJECT_ROOT / TTS_REPLACEMENTS_FILE
+# Spoken "From {site} dot com" intro/outro on article audio (requires source domain)
+TTS_SOURCE_BRANDING_ENABLED = _bool("TTS_SOURCE_BRANDING_ENABLED", True)
+# Silence prepended before narration (milliseconds)
+TTS_LEAD_SILENCE_MS = _int("TTS_LEAD_SILENCE_MS", 1000)
+# Crossfade between TTS chunks to reduce clicks at stitch points (milliseconds)
+TTS_CHUNK_CROSSFADE_MS = _int("TTS_CHUNK_CROSSFADE_MS", 50)
+# Final MP3 encode: sample rate and CBR bitrate (better mobile decoder compatibility)
+TTS_MP3_SAMPLE_RATE = _int("TTS_MP3_SAMPLE_RATE", 44100)
+TTS_MP3_BITRATE = os.environ.get("TTS_MP3_BITRATE", "128k").strip() or "128k"
+# Ollama suggestions for /pronounce and "Fix a word" button
+PRONUNCIATION_SUGGEST_ENABLED = _bool("PRONUNCIATION_SUGGEST_ENABLED", True)
+PRONUNCIATION_SUGGEST_COUNT = _int("PRONUNCIATION_SUGGEST_COUNT", 4)
+PRONUNCIATION_OLLAMA_TIMEOUT = _int("PRONUNCIATION_OLLAMA_TIMEOUT", 120)
 LAST_ARTICLE_TTL_SECONDS = _int("LAST_ARTICLE_TTL_SECONDS", 72 * 3600)
 ARTICLE_CACHE_DIR = Path(os.environ.get("ARTICLE_CACHE_DIR", "data/article_cache"))
 if not ARTICLE_CACHE_DIR.is_absolute():
@@ -149,6 +162,6 @@ BRIEFING_OUTPUT_DIR = Path(os.environ.get("BRIEFING_OUTPUT_DIR", "data/briefings
 if not BRIEFING_OUTPUT_DIR.is_absolute():
     BRIEFING_OUTPUT_DIR = PROJECT_ROOT / BRIEFING_OUTPUT_DIR
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").strip()
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2").strip()
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1:8b").strip()
 BRIEFING_TARGET_MINUTES = _int("BRIEFING_TARGET_MINUTES", 60)
 BRIEFING_WORDS_PER_MINUTE = _int("BRIEFING_WORDS_PER_MINUTE", 150)

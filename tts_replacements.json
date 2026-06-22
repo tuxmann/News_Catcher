@@ -1,14 +1,53 @@
 {
   "replacements": [
-    {"from": "U.S.A.", "to": "United States"},
-    {"from": "U.S.", "to": "United States"},
-    {"from": "U.S", "to": "United States"},
-    {"from": "U.K.", "to": "United Kingdom"},
-    {"from": "U.K", "to": "United Kingdom"},
-    {"from": "E.U.", "to": "European Union"},
-    {"from": "E.U", "to": "European Union"},
-    {"from": "U.N.", "to": "United Nations"},
-    {"from": "U.N", "to": "United Nations"}
+    {
+      "from": "U.S.A.",
+      "to": "United States"
+    },
+    {
+      "from": "U.S.",
+      "to": "United States"
+    },
+    {
+      "from": "U.S",
+      "to": "United States"
+    },
+    {
+      "from": "U.K.",
+      "to": "United Kingdom"
+    },
+    {
+      "from": "U.K",
+      "to": "United Kingdom"
+    },
+    {
+      "from": "E.U.",
+      "to": "European Union"
+    },
+    {
+      "from": "E.U",
+      "to": "European Union"
+    },
+    {
+      "from": "U.N.",
+      "to": "United Nations"
+    },
+    {
+      "from": "U.N",
+      "to": "United Nations"
+    },
+    {
+      "from": "fox10phoenix",
+      "to": "fox ten fehnix"
+    },
+    {
+      "from": "Ariz.",
+      "to": "Arizona"
+    },
+    {
+      "from": "a.m.",
+      "to": "A eM"
+    }
   ],
   "regex": [
     {

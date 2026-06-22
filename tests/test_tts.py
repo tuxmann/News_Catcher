@@ -24,6 +24,10 @@ class TestTtsTextPrep(unittest.TestCase):
         out = build_narration_text("Headline", "Body.")
         self.assertEqual(out, "Headline. Body.")
 
+    def test_narration_skips_duplicate_title(self) -> None:
+        out = build_narration_text("Headline", "Headline. Body continues.")
+        self.assertEqual(out, "Headline. Body continues.")
+
     def test_chunk_splits_long_paragraph(self) -> None:
         text = "a" * 5000
         chunks = chunk_text_for_tts(text, max_chars=1000)

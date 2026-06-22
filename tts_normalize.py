@@ -119,7 +119,7 @@ def normalize_for_tts(
     literals = sorted(rules.literals, key=lambda pair: len(pair[0]), reverse=True)
     out = text
     for src, dst in literals:
-        out = out.replace(src, dst)
+        out = re.sub(re.escape(src), dst, out, flags=re.IGNORECASE)
     for rule in rules.regex:
         out = rule.pattern.sub(rule.replace, out)
     return out
