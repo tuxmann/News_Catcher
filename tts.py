@@ -288,7 +288,12 @@ def pronunciation_sample_phrase(variant: str) -> str:
     return f"The word is: {variant.strip()}."
 
 
-def synthesize_pronunciation_sample(variant: str, output_path: Path) -> Path:
+def synthesize_pronunciation_sample(
+    variant: str,
+    output_path: Path,
+    *,
+    lead_silence_ms: int = 0,
+) -> Path:
     """Synthesize a short MP3 for one spelling variant (for /pronounce)."""
     phrase = pronunciation_sample_phrase(variant)
     return synthesize_to_mp3(
@@ -296,7 +301,7 @@ def synthesize_pronunciation_sample(variant: str, output_path: Path) -> Path:
         output_path,
         title=None,
         chunk_chars=300,
-        lead_silence_ms=0,
+        lead_silence_ms=lead_silence_ms,
     )
 
 

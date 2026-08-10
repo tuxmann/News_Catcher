@@ -39,6 +39,9 @@ ADMIN_PIN = os.environ.get("ADMIN_PIN", "").strip()
 DOMAINS_FILE = Path(os.environ.get("DOMAINS_FILE", "domains.json"))
 if not DOMAINS_FILE.is_absolute():
     DOMAINS_FILE = PROJECT_ROOT / DOMAINS_FILE
+DOMAINS_BAD_FILE = Path(os.environ.get("DOMAINS_BAD_FILE", "domains_bad.json"))
+if not DOMAINS_BAD_FILE.is_absolute():
+    DOMAINS_BAD_FILE = PROJECT_ROOT / DOMAINS_BAD_FILE
 
 FETCH_SOFT_MAX_BYTES = _int("FETCH_SOFT_MAX_BYTES", 5 * 1024 * 1024)
 FETCH_HARD_MAX_BYTES = _int("FETCH_HARD_MAX_BYTES", 20 * 1024 * 1024)
@@ -118,6 +121,17 @@ TTS_NORMALIZE_ENABLED = _bool("TTS_NORMALIZE_ENABLED", True)
 TTS_REPLACEMENTS_FILE = Path(os.environ.get("TTS_REPLACEMENTS_FILE", "tts_replacements.json"))
 if not TTS_REPLACEMENTS_FILE.is_absolute():
     TTS_REPLACEMENTS_FILE = PROJECT_ROOT / TTS_REPLACEMENTS_FILE
+# Short ALL-CAPS tokens (no tts_replacements rule): Ollama decides acronym vs emphasis
+TTS_ACRONYM_ENABLED = _bool("TTS_ACRONYM_ENABLED", True)
+TTS_ACRONYM_OLLAMA_ENABLED = _bool("TTS_ACRONYM_OLLAMA_ENABLED", True)
+TTS_ACRONYM_MIN_LETTERS = _int("TTS_ACRONYM_MIN_LETTERS", 2)
+TTS_ACRONYM_MAX_LETTERS = _int("TTS_ACRONYM_MAX_LETTERS", 5)
+TTS_ACRONYM_OLLAMA_TIMEOUT = _int("TTS_ACRONYM_OLLAMA_TIMEOUT", 60)
+# Month abbreviations (Jan → January): Ollama decides month vs name/other
+TTS_MONTH_ENABLED = _bool("TTS_MONTH_ENABLED", True)
+TTS_MONTH_OLLAMA_ENABLED = _bool("TTS_MONTH_OLLAMA_ENABLED", True)
+TTS_MONTH_OLLAMA_TIMEOUT = _int("TTS_MONTH_OLLAMA_TIMEOUT", 60)
+TTS_MONTH_DATE_FALLBACK = _bool("TTS_MONTH_DATE_FALLBACK", True)
 # Spoken "From {site} dot com" intro/outro on article audio (requires source domain)
 TTS_SOURCE_BRANDING_ENABLED = _bool("TTS_SOURCE_BRANDING_ENABLED", True)
 # Silence prepended before narration (milliseconds)
@@ -165,3 +179,16 @@ OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").strip()
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1:8b").strip()
 BRIEFING_TARGET_MINUTES = _int("BRIEFING_TARGET_MINUTES", 60)
 BRIEFING_WORDS_PER_MINUTE = _int("BRIEFING_WORDS_PER_MINUTE", 150)
+
+# Deep research (GUI): Google News topic → Ollama article
+RESEARCH_MAX_ARTICLES = _int("RESEARCH_MAX_ARTICLES", 10)
+RESEARCH_TARGET_WORDS = _int("RESEARCH_TARGET_WORDS", 1000)
+RESEARCH_OLLAMA_TIMEOUT = _int("RESEARCH_OLLAMA_TIMEOUT", 300)
+
+# Blog watchlist: poll RSS/WordPress and notify on new posts
+WATCHLIST_ENABLED = _bool("WATCHLIST_ENABLED", True)
+WATCHLIST_FILE = Path(os.environ.get("WATCHLIST_FILE", "data/watchlist.json"))
+if not WATCHLIST_FILE.is_absolute():
+    WATCHLIST_FILE = PROJECT_ROOT / WATCHLIST_FILE
+WATCHLIST_TICK_SECONDS = _int("WATCHLIST_TICK_SECONDS", 60)
+WATCHLIST_DEFAULT_INTERVAL_MINUTES = _int("WATCHLIST_DEFAULT_INTERVAL_MINUTES", 60)

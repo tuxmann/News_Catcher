@@ -7,9 +7,33 @@ import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
+
 import config
+from tts_acronym import apply_short_caps_acronyms
+from tts_month import apply_month_abbreviations
+from tts_numbers import apply_long_numbers
 
 logger = logging.getLogger(__name__)
+
+# 3,000km → 3,000 (TTS reads the number; drop redundant unit).
+_DISTANCE_UNIT_RE = re.compile(
+    r"(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)\s*"
+    r"(?:km|kilometers|kilometres|kms|mi|miles|mile)\b",
+    re.IGNORECASE,
+)
+
+# Memorandum Of Understanding (MOU) → Memorandum Of Understanding
+_REDUNDANT_ACRONYM_RE = re.compile(
+    r"\b((?:[A-Z][\w]*\s+){1,}[A-Z][\w]*)\s+\(([A-Z]{2,10})\)(?=[\s.,;:!?\)]|$)"
+)
+
+
+@dataclass(frozen=True)
+class LiteralReplacement:
+    from_text: str
+    to_text: str
+    whole_word: bool = True
+    ignore_case: bool = False
 
 
 @dataclass(frozen=True)
@@ -22,7 +46,7 @@ class RegexReplacement:
 class TtsReplacementRules:
     """Ordered literal replacements (longest `from` first) plus regex rules."""
 
-    literals: list[tuple[str, str]]
+    literals: list[LiteralReplacement]
     regex: list[RegexReplacement]
 
 
@@ -30,12 +54,41 @@ _rules_cache: TtsReplacementRules | None = None
 _rules_cache_path: Path | None = None
 
 
+def _bool_field(raw: object, default: bool) -> bool:
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    return default
+
+
+def _default_whole_word(from_text: str) -> bool:
+    """Whole-word match avoids replacing US inside push."""
+    if any(ch in from_text for ch in ".-/"):
+        return True
+    if len(from_text) <= 4 and from_text.isalpha():
+        return True
+    return True
+
+
+def _literal_regex(src: str, whole_word: bool, ignore_case: bool) -> re.Pattern[str]:
+    escaped = re.escape(src)
+    if whole_word:
+        body = rf"(?<![A-Za-z0-9]){escaped}(?![A-Za-z0-9])"
+    else:
+        body = escaped
+    flags = re.IGNORECASE if ignore_case else 0
+    return re.compile(body, flags)
+
+
 def _parse_replacements_file(path: Path) -> TtsReplacementRules:
     raw = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
         raise ValueError(f"{path}: root must be a JSON object")
 
-    literals: list[tuple[str, str]] = []
+    literals: list[LiteralReplacement] = []
     for item in raw.get("replacements", []):
         if not isinstance(item, dict):
             raise ValueError(f"{path}: each replacement must be an object")
@@ -43,10 +96,18 @@ def _parse_replacements_file(path: Path) -> TtsReplacementRules:
         dst = item.get("to")
         if not isinstance(src, str) or not isinstance(dst, str):
             raise ValueError(f"{path}: replacement needs string 'from' and 'to'")
-        if src:
-            literals.append((src, dst))
+        if not src:
+            continue
+        literals.append(
+            LiteralReplacement(
+                from_text=src,
+                to_text=dst,
+                whole_word=_bool_field(item.get("whole_word"), _default_whole_word(src)),
+                ignore_case=_bool_field(item.get("ignore_case"), False),
+            )
+        )
 
-    literals.sort(key=lambda pair: len(pair[0]), reverse=True)
+    literals.sort(key=lambda r: len(r.from_text), reverse=True)
 
     regex_rules: list[RegexReplacement] = []
     for item in raw.get("regex", []):
@@ -97,6 +158,12 @@ def load_tts_replacement_rules(path: Path | None = None, *, reload: bool = False
     return rules
 
 
+def _apply_builtin_preprocess(text: str) -> str:
+    text = _DISTANCE_UNIT_RE.sub(r"\1", text)
+    text = _REDUNDANT_ACRONYM_RE.sub(r"\1", text)
+    return text
+
+
 def normalize_for_tts(
     text: str,
     *,
@@ -115,13 +182,17 @@ def normalize_for_tts(
     if not enabled:
         return text
 
+    out = _apply_builtin_preprocess(text)
     rules = rules if rules is not None else load_tts_replacement_rules()
-    literals = sorted(rules.literals, key=lambda pair: len(pair[0]), reverse=True)
-    out = text
-    for src, dst in literals:
-        out = re.sub(re.escape(src), dst, out, flags=re.IGNORECASE)
+    literals = sorted(rules.literals, key=lambda r: len(r.from_text), reverse=True)
+    for rule in literals:
+        pattern = _literal_regex(rule.from_text, rule.whole_word, rule.ignore_case)
+        out = pattern.sub(rule.to_text, out)
     for rule in rules.regex:
         out = rule.pattern.sub(rule.replace, out)
+    out = apply_long_numbers(out)
+    out = apply_month_abbreviations(out, rules)
+    out = apply_short_caps_acronyms(out, rules)
     return out
 
 
@@ -159,7 +230,14 @@ def write_replacements_document(doc: dict, path: Path | None = None) -> Path:
     return path
 
 
-def add_literal_replacement(from_str: str, to_str: str, *, path: Path | None = None) -> bool:
+def add_literal_replacement(
+    from_str: str,
+    to_str: str,
+    *,
+    path: Path | None = None,
+    whole_word: bool = True,
+    ignore_case: bool = False,
+) -> bool:
     """
     Append a literal replacement if not already present. Returns True if added.
     """
@@ -174,10 +252,107 @@ def add_literal_replacement(from_str: str, to_str: str, *, path: Path | None = N
     for item in replacements:
         if isinstance(item, dict) and item.get("from") == src:
             item["to"] = dst
+            item["whole_word"] = whole_word
+            item["ignore_case"] = ignore_case
             doc["replacements"] = replacements
             write_replacements_document(doc, path)
             return False
-    replacements.append({"from": src, "to": dst})
+    replacements.append(
+        {
+            "from": src,
+            "to": dst,
+            "whole_word": whole_word,
+            "ignore_case": ignore_case,
+        }
+    )
     doc["replacements"] = replacements
     write_replacements_document(doc, path)
     return True
+
+
+def remove_literal_replacement(from_str: str, *, path: Path | None = None) -> bool:
+    """Remove a literal rule by exact `from` value. Returns True if removed."""
+    src = from_str.strip()
+    if not src:
+        raise ValueError("from must be non-empty")
+    doc = read_replacements_document(path)
+    replacements = doc.get("replacements", [])
+    if not isinstance(replacements, list):
+        return False
+    kept: list[object] = []
+    removed = False
+    for item in replacements:
+        if isinstance(item, dict) and item.get("from") == src:
+            removed = True
+            continue
+        kept.append(item)
+    if not removed:
+        return False
+    doc["replacements"] = kept
+    write_replacements_document(doc, path)
+    return True
+
+
+def _literal_from_doc_item(item: object) -> LiteralReplacement | None:
+    if not isinstance(item, dict):
+        return None
+    src = item.get("from")
+    dst = item.get("to")
+    if not isinstance(src, str) or not isinstance(dst, str) or not src.strip():
+        return None
+    return LiteralReplacement(
+        from_text=src,
+        to_text=dst,
+        whole_word=_bool_field(item.get("whole_word"), _default_whole_word(src)),
+        ignore_case=_bool_field(item.get("ignore_case"), False),
+    )
+
+
+def list_literal_replacements(*, path: Path | None = None) -> list[LiteralReplacement]:
+    """All literal rules from the replacements file (document order)."""
+    doc = read_replacements_document(path)
+    out: list[LiteralReplacement] = []
+    for item in doc.get("replacements", []):
+        rule = _literal_from_doc_item(item)
+        if rule is not None:
+            out.append(rule)
+    return out
+
+
+def _match_score(query: str, candidate: str) -> float:
+    """Higher is better; used to rank existing pronunciation rules."""
+    from difflib import SequenceMatcher
+
+    q = query.casefold().strip()
+    c = candidate.casefold().strip()
+    if not q or not c:
+        return 0.0
+    if q == c:
+        return 1.0
+    if q in c or c in q:
+        return 0.85 + 0.1 * (min(len(q), len(c)) / max(len(q), len(c)))
+    return SequenceMatcher(None, q, c).ratio()
+
+
+def find_literal_replacements(
+    query: str,
+    *,
+    path: Path | None = None,
+    limit: int = 8,
+) -> list[LiteralReplacement]:
+    """
+    Rank literal rules by similarity to query (matches `from` or `to`).
+    Returns up to `limit` rules, best first.
+    """
+    q = query.strip()
+    if not q or limit <= 0:
+        return []
+    scored: list[tuple[float, int, LiteralReplacement]] = []
+    for idx, rule in enumerate(list_literal_replacements(path=path)):
+        score = max(_match_score(q, rule.from_text), _match_score(q, rule.to_text))
+        # 0.55 filters structurally similar short tokens (a.m. vs U.S. ≈ 0.5).
+        if score < 0.55:
+            continue
+        scored.append((score, idx, rule))
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    return [rule for _, _, rule in scored[:limit]]

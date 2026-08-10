@@ -10,6 +10,8 @@ from article_cache import CachedArticle
 from article_export import (
     is_save_to_disk_phrase,
     save_article_text_file,
+    site_to_filename_stem,
+    telegram_audio_filename,
     title_to_filename_stem,
 )
 
@@ -40,6 +42,24 @@ class TestTitleFilename(unittest.TestCase):
     def test_untitled_fallback(self) -> None:
         self.assertEqual(title_to_filename_stem(None), "untitled")
         self.assertEqual(title_to_filename_stem("!!!"), "untitled")
+
+
+class TestTelegramAudioFilename(unittest.TestCase):
+    def test_site_stem(self) -> None:
+        self.assertEqual(site_to_filename_stem("reuters.com"), "reuters_com")
+        self.assertEqual(site_to_filename_stem("www.bbc.com"), "bbc_com")
+
+    def test_prepends_site(self) -> None:
+        self.assertEqual(
+            telegram_audio_filename("reuters.com", "Markets Rally Today Fast"),
+            "reuters_com_Markets_Rally_Today_Fast.mp3",
+        )
+
+    def test_multipart(self) -> None:
+        self.assertEqual(
+            telegram_audio_filename("a.com", "Hi", part=2, total=3),
+            "a_com_Hi_part2.mp3",
+        )
 
 
 class TestSaveArticleTextFile(unittest.TestCase):

@@ -3,13 +3,24 @@
 from __future__ import annotations
 
 import asyncio
+import html as html_module
 import logging
 import re
 import secrets
 import time
 from dataclasses import dataclass, field
+from urllib.parse import urlparse
+
 import httpx
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, MessageEntity, Update
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputFile,
+    Message,
+    MessageEntity,
+    Update,
+)
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
@@ -23,12 +34,22 @@ from telegram.ext import (
 import config
 from article_format import format_paragraphs_for_telegram
 from article_cache import load_last_article, purge_expired as purge_article_cache, save_last_article
-from article_export import is_save_to_disk_phrase, save_article_text_file
+from article_export import (
+    is_save_to_disk_phrase,
+    save_article_text_file,
+    telegram_audio_filename,
+)
 from domains_store import (
+    add_bad_domain,
+    bad_domain_refusal_message,
+    host_allowed,
+    host_is_bad,
     is_valid_registrable_domain,
+    load_bad_domains,
     load_domains,
     normalize_registrable_hint,
     registrable_domain_from_url,
+    save_bad_domains,
     save_domains,
 )
 from extract import extract_article
@@ -46,7 +67,27 @@ from tts import (
     synthesize_pronunciation_sample,
     synthesize_to_mp3,
 )
-from tts_normalize import add_literal_replacement
+from tts_normalize import (
+    add_literal_replacement,
+    find_literal_replacements,
+    remove_literal_replacement,
+)
+from watchlist import (
+    CandidatePost,
+    check_site,
+    domain_hint_from_user_input,
+    first_paragraph,
+)
+from watchlist_store import (
+    DEFAULT_CHECK_INTERVAL_MINUTES,
+    WatchedSite,
+    get_site,
+    load_watchlist,
+    remove_site,
+    set_interval,
+    site_is_due,
+    upsert_site,
+)
 
 
 def _fetch_error_reply(exc: FetchError) -> str:
@@ -104,11 +145,22 @@ _BOT_COMMAND_NAMES = frozenset(
         "list_domains",
         "add_domain",
         "remove_domain",
+        "list_bad_domains",
+        "remove_bad_domain",
+        "override_bad_domain",
         "fix_403",
         "pronounce",
         "add_pronunciation",
+        "find_pronunciation",
+        "delete_pronunciation",
         "fixaword",
         "speak",
+        "nevermind",
+        "watch_add",
+        "watch_list",
+        "watch_remove",
+        "watch_interval",
+        "watch_check",
     }
 )
 
@@ -143,9 +195,14 @@ UNLISTED_SLASH_COMMAND = UnlistedSlashCommandFilter()
 
 PENDING_OVERSIZE: dict[str, "PendingOversize"] = {}
 PENDING_DOMAIN_ADD: dict[str, "PendingDomainAdd"] = {}
+PENDING_DOMAIN_BAD: dict[str, "PendingDomainBad"] = {}
 PENDING_PRONUNCIATION: dict[str, "PendingPronunciation"] = {}
+PRONUNCIATION_BATCHES: dict[str, list[tuple[str, int, int]]] = {}
 PENDING_WORD_FIX: dict[int, "PendingWordFix"] = {}
 PENDING_SPEAK_PHRASE: dict[int, "PendingSpeakPhrase"] = {}
+PENDING_RULE_ACTION: dict[str, "PendingRuleAction"] = {}
+PENDING_FIND_SESSION: dict[str, "PendingFindSession"] = {}
+PENDING_WATCH_POST: dict[str, "PendingWatchPost"] = {}
 
 # Inline actions after an article is delivered (callback_data must be <= 64 bytes).
 _CALLBACK_SPEAK = "a:speak"
@@ -162,6 +219,7 @@ WORD_FIX_HELP = (
     "2. Ollama suggests spellings — you'll get a short audio clip for each.\n"
     "3. Tap Save on the sample you like (writes to tts_replacements.json).\n"
     "4. Not happy? Tap Retry, Send feedback, or My spelling to try your own.\n\n"
+    "Send /nevermind anytime to cancel and wait for the next article URL.\n\n"
     "Example words: Polish, U.S., a.m., Mesa"
 )
 
@@ -179,6 +237,9 @@ class PendingPronunciation:
     from_text: str
     to_text: str
     expires_monotonic: float
+    chat_id: int
+    message_id: int
+    batch_id: str
 
 
 @dataclass
@@ -186,6 +247,14 @@ class PendingDomainAdd:
     user_id: int
     url: str
     domain: str
+    expires_monotonic: float
+
+
+@dataclass
+class PendingDomainBad:
+    user_id: int
+    domain: str
+    url: str
     expires_monotonic: float
 
 
@@ -210,21 +279,53 @@ class PendingSpeakPhrase:
     expires_monotonic: float
 
 
+@dataclass
+class PendingRuleAction:
+    """Find-pronunciation match: pronounce or delete an existing rule."""
+
+    user_id: int
+    from_text: str
+    to_text: str
+    expires_monotonic: float
+
+
+@dataclass
+class PendingFindSession:
+    """Session after /find_pronunciation: confirm pronounce-all."""
+
+    user_id: int
+    matches: list[tuple[str, str]]
+    expires_monotonic: float
+
+
+@dataclass
+class PendingWatchPost:
+    """Watchlist notify: Read or Speak a new blog post."""
+
+    user_id: int
+    url: str
+    title: str
+    expires_monotonic: float
+
+
 def _allowed_user(user_id: int) -> bool:
     if not config.ALLOWED_TELEGRAM_USER_IDS:
         return False
     return user_id in config.ALLOWED_TELEGRAM_USER_IDS
 
 
-def _article_actions_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
+def _article_actions_keyboard(*, block_token: str | None = None) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = [
         [
-            [
-                InlineKeyboardButton("Speak to me", callback_data=_CALLBACK_SPEAK),
-                InlineKeyboardButton("Save to disk", callback_data=_CALLBACK_SAVE),
-            ],
-        ]
-    )
+            InlineKeyboardButton("Speak to me", callback_data=_CALLBACK_SPEAK),
+            InlineKeyboardButton("Save to disk", callback_data=_CALLBACK_SAVE),
+        ],
+    ]
+    if block_token:
+        rows.append(
+            [InlineKeyboardButton("Block website", callback_data=f"b:{block_token}")]
+        )
+    return InlineKeyboardMarkup(rows)
 
 
 def _word_fix_followup_keyboard() -> InlineKeyboardMarkup:
@@ -251,7 +352,8 @@ async def _send_word_fix_followup(
     from_text: str,
     tried_spellings: list[str],
     message: str = (
-        "Tap Save on a sample you like, or use the buttons below for more options."
+        "Tap Save on a sample you like, or use the buttons below for more options.\n"
+        "Send /nevermind to cancel and wait for the next article URL."
     ),
 ) -> None:
     _pending_word_fix_put(
@@ -493,6 +595,9 @@ def _purge_expired_pending() -> None:
     dead_d = [k for k, v in PENDING_DOMAIN_ADD.items() if now > v.expires_monotonic]
     for k in dead_d:
         del PENDING_DOMAIN_ADD[k]
+    dead_b = [k for k, v in PENDING_DOMAIN_BAD.items() if now > v.expires_monotonic]
+    for k in dead_b:
+        del PENDING_DOMAIN_BAD[k]
     dead_p = [k for k, v in PENDING_PRONUNCIATION.items() if now > v.expires_monotonic]
     for k in dead_p:
         del PENDING_PRONUNCIATION[k]
@@ -502,10 +607,87 @@ def _purge_expired_pending() -> None:
     expired_speak = [uid for uid, v in PENDING_SPEAK_PHRASE.items() if now > v.expires_monotonic]
     for uid in expired_speak:
         del PENDING_SPEAK_PHRASE[uid]
+    dead_ra = [k for k, v in PENDING_RULE_ACTION.items() if now > v.expires_monotonic]
+    for k in dead_ra:
+        del PENDING_RULE_ACTION[k]
+    dead_fs = [k for k, v in PENDING_FIND_SESSION.items() if now > v.expires_monotonic]
+    for k in dead_fs:
+        del PENDING_FIND_SESSION[k]
+    dead_w = [k for k, v in PENDING_WATCH_POST.items() if now > v.expires_monotonic]
+    for k in dead_w:
+        del PENDING_WATCH_POST[k]
+
+
+def _pending_rule_action_put(user_id: int, from_text: str, to_text: str) -> str:
+    token = secrets.token_hex(6)
+    PENDING_RULE_ACTION[token] = PendingRuleAction(
+        user_id=user_id,
+        from_text=from_text,
+        to_text=to_text,
+        expires_monotonic=time.monotonic() + config.PENDING_OVERSIZE_TTL,
+    )
+    return token
+
+
+def _pending_rule_action_get(token: str) -> PendingRuleAction | None:
+    p = PENDING_RULE_ACTION.get(token)
+    if p is None:
+        return None
+    if time.monotonic() > p.expires_monotonic:
+        del PENDING_RULE_ACTION[token]
+        return None
+    return p
+
+
+def _pending_find_session_put(user_id: int, matches: list[tuple[str, str]]) -> str:
+    token = secrets.token_hex(6)
+    PENDING_FIND_SESSION[token] = PendingFindSession(
+        user_id=user_id,
+        matches=matches,
+        expires_monotonic=time.monotonic() + config.PENDING_OVERSIZE_TTL,
+    )
+    return token
+
+
+def _pending_find_session_get(token: str) -> PendingFindSession | None:
+    p = PENDING_FIND_SESSION.get(token)
+    if p is None:
+        return None
+    if time.monotonic() > p.expires_monotonic:
+        del PENDING_FIND_SESSION[token]
+        return None
+    return p
+
+
+def _pending_watch_post_put(user_id: int, url: str, title: str) -> str:
+    token = secrets.token_hex(6)
+    PENDING_WATCH_POST[token] = PendingWatchPost(
+        user_id=user_id,
+        url=url,
+        title=title,
+        expires_monotonic=time.monotonic() + config.PENDING_OVERSIZE_TTL,
+    )
+    return token
+
+
+def _pending_watch_post_get(token: str) -> PendingWatchPost | None:
+    p = PENDING_WATCH_POST.get(token)
+    if p is None:
+        return None
+    if time.monotonic() > p.expires_monotonic:
+        del PENDING_WATCH_POST[token]
+        return None
+    return p
 
 
 def _pending_pronunciation_put(
-    user_id: int, from_text: str, to_text: str
+    user_id: int,
+    from_text: str,
+    to_text: str,
+    *,
+    chat_id: int,
+    message_id: int,
+    batch_id: str,
 ) -> str:
     token = secrets.token_urlsafe(8)
     PENDING_PRONUNCIATION[token] = PendingPronunciation(
@@ -513,6 +695,9 @@ def _pending_pronunciation_put(
         from_text=from_text,
         to_text=to_text,
         expires_monotonic=time.monotonic() + config.PENDING_OVERSIZE_TTL,
+        chat_id=chat_id,
+        message_id=message_id,
+        batch_id=batch_id,
     )
     return token
 
@@ -529,6 +714,34 @@ def _pending_pronunciation_get(token: str) -> PendingPronunciation | None:
 
 def _pending_pronunciation_remove(token: str) -> None:
     PENDING_PRONUNCIATION.pop(token, None)
+
+
+def _clear_user_interactive_state(user_id: int) -> None:
+    """Drop word-fix / speak-phrase / pronunciation sample sessions."""
+    PENDING_WORD_FIX.pop(user_id, None)
+    PENDING_SPEAK_PHRASE.pop(user_id, None)
+    batch_ids = {p.batch_id for p in PENDING_PRONUNCIATION.values() if p.user_id == user_id}
+    for token in [t for t, p in PENDING_PRONUNCIATION.items() if p.user_id == user_id]:
+        _pending_pronunciation_remove(token)
+    for batch_id in batch_ids:
+        PRONUNCIATION_BATCHES.pop(batch_id, None)
+
+
+async def _delete_other_pronunciation_samples(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    batch_id: str,
+    keep_token: str,
+) -> None:
+    entries = PRONUNCIATION_BATCHES.pop(batch_id, [])
+    for token, chat_id, message_id in entries:
+        if token == keep_token:
+            continue
+        _pending_pronunciation_remove(token)
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except TelegramError:
+            pass
 
 
 def _pending_word_fix_put(
@@ -641,6 +854,60 @@ def _pending_domain_remove(token: str) -> None:
     PENDING_DOMAIN_ADD.pop(token, None)
 
 
+def _pending_domain_bad_put(user_id: int, domain: str, url: str) -> tuple[str, InlineKeyboardMarkup]:
+    token = secrets.token_hex(8)
+    PENDING_DOMAIN_BAD[token] = PendingDomainBad(
+        user_id=user_id,
+        domain=domain,
+        url=url,
+        expires_monotonic=time.monotonic() + config.PENDING_OVERSIZE_TTL,
+    )
+    kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Block website", callback_data=f"b:{token}"),
+                InlineKeyboardButton("Keep on list", callback_data=f"k:{token}"),
+            ]
+        ]
+    )
+    return token, kb
+
+
+def _pending_domain_bad_get(token: str) -> PendingDomainBad | None:
+    p = PENDING_DOMAIN_BAD.get(token)
+    if p is None:
+        return None
+    if time.monotonic() > p.expires_monotonic:
+        del PENDING_DOMAIN_BAD[token]
+        return None
+    return p
+
+
+def _pending_domain_bad_remove(token: str) -> None:
+    PENDING_DOMAIN_BAD.pop(token, None)
+
+
+async def _offer_mark_domain_bad(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    domain: str,
+    url: str,
+    reason: str,
+) -> None:
+    if not update.effective_user:
+        return
+    _, kb = _pending_domain_bad_put(update.effective_user.id, domain, url)
+    await _reply_on_chat(
+        update,
+        context,
+        f"{reason}\n\n"
+        f"Can't get a usable article from {domain}?\n"
+        "Block website adds it to domains_bad.json and removes it from the approved list.",
+        reply_markup=kb,
+    )
+
+
 def _format_size(num: int) -> str:
     if num >= 1024 * 1024:
         return f"{num / (1024 * 1024):.2f} MB"
@@ -655,6 +922,8 @@ async def _process_fetched_html(
     html_bytes: bytes,
     final_url: str,
     content_type: str | None,
+    *,
+    domain_trial: str | None = None,
 ) -> None:
     chat_id = update.effective_chat.id
     if content_type and "html" not in content_type.lower() and "xml" not in content_type.lower():
@@ -667,6 +936,14 @@ async def _process_fetched_html(
     except Exception as e:
         logger.exception("extract failed")
         await context.bot.send_message(chat_id, f"Could not extract article text: {e}")
+        if domain_trial:
+            await _offer_mark_domain_bad(
+                update,
+                context,
+                domain=domain_trial,
+                url=final_url,
+                reason=f"Could not extract article text: {e}",
+            )
         return
 
     if not article.text.strip():
@@ -674,6 +951,14 @@ async def _process_fetched_html(
             chat_id,
             "No article body found in the HTML (paywall, JS-only page, or unsupported layout).",
         )
+        if domain_trial:
+            await _offer_mark_domain_bad(
+                update,
+                context,
+                domain=domain_trial,
+                url=final_url,
+                reason="No article body found in the HTML.",
+            )
         return
 
     header_parts = [f"URL: {final_url}"]
@@ -715,10 +1000,17 @@ async def _process_fetched_html(
                 await context.bot.send_message(chat_id, f"{caption}\n{image.url}")
 
     if update.effective_user:
+        block_token: str | None = None
+        if domain_trial:
+            block_token, _ = _pending_domain_bad_put(
+                update.effective_user.id,
+                domain_trial,
+                final_url,
+            )
         await context.bot.send_message(
             chat_id,
             "What would you like to do next?",
-            reply_markup=_article_actions_keyboard(),
+            reply_markup=_article_actions_keyboard(block_token=block_token),
         )
 
 
@@ -787,6 +1079,28 @@ async def cmd_speak(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _run_speak_phrase(update, context, phrase)
 
 
+async def cmd_nevermind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Cancel word-fix / speak-phrase sessions and return to waiting for a URL."""
+    if not update.effective_user or not update.message:
+        return
+    if not _allowed_user(update.effective_user.id):
+        await update.message.reply_text("You are not authorized.")
+        return
+    user_id = update.effective_user.id
+    had_word_fix = user_id in PENDING_WORD_FIX
+    had_speak = user_id in PENDING_SPEAK_PHRASE
+    had_samples = any(p.user_id == user_id for p in PENDING_PRONUNCIATION.values())
+    _clear_user_interactive_state(user_id)
+    if not (had_word_fix or had_speak or had_samples):
+        await update.message.reply_text(
+            "Nothing to cancel. Send me a news article URL when you're ready."
+        )
+        return
+    await update.message.reply_text(
+        "Okay — cancelled. Send me a news article URL when you're ready."
+    )
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.message:
         return
@@ -800,10 +1114,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "After each article you can tap Speak to me or Save to disk, "
         "or type those phrases.\n"
         "After audio is ready, tap Fix a word or send /fixaword to tune pronunciation.\n\n"
-        "Commands: /list_domains, /add_domain, /remove_domain, /fix_403\n"
+        "Commands: /list_domains, /add_domain, /remove_domain, /list_bad_domains, "
+        "/override_bad_domain, /fix_403\n"
         "TTS: /speak <phrase> — hear one sentence with current pronunciations\n"
         "     /fixaword — reply with a word to fix; /pronounce <word> [alt1 …]\n"
-        "     /add_pronunciation <from> <to> — add a rule without audio preview"
+        "     /find_pronunciation <word> — find saved rules; pronounce or delete\n"
+        "     /delete_pronunciation <from> — remove a rule from tts_replacements.json\n"
+        "     /add_pronunciation <from> <to> — add a rule without audio preview\n"
+        "     /nevermind — cancel fix-a-word or other in-progress prompts\n"
+        "Watch: /watch_add <site> [minutes] — poll a blog for new posts\n"
+        "       /watch_list, /watch_remove, /watch_interval, /watch_check"
     )
 
 
@@ -928,6 +1248,128 @@ async def cmd_remove_domain(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text(f"Removed domain: {domain}")
 
 
+async def cmd_list_bad_domains(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not _allowed_user(update.effective_user.id):
+        await update.message.reply_text("You are not authorized.")
+        return
+    domains = sorted(load_bad_domains(config.DOMAINS_BAD_FILE))
+    if not domains:
+        await update.message.reply_text("No bad domains recorded.")
+        return
+    await update.message.reply_text("Bad domains (extraction failed):\n" + "\n".join(domains))
+
+
+async def cmd_remove_bad_domain(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not _allowed_user(update.effective_user.id):
+        await update.message.reply_text("You are not authorized.")
+        return
+
+    args = list(context.args or [])
+    pending = context.user_data.get("last_bad_domain") or {}
+    domain: str | None = None
+
+    # Tapping /remove_bad_domain in a refusal message sends no args — use the
+    # domain from the URL that was just blocked.
+    if not args and pending.get("domain"):
+        domain = normalize_registrable_hint(str(pending["domain"]))
+    else:
+        ok, domain_or_err = _parse_pin_domain(args, usage_cmd="/remove_bad_domain")
+        if not ok:
+            hint = ""
+            if pending.get("domain"):
+                hint = (
+                    f"\n\nOr send /remove_bad_domain right after a blocked article "
+                    f"(removes {pending['domain']})."
+                )
+            await update.message.reply_text((domain_or_err or "Bad request.") + hint)
+            return
+        domain = normalize_registrable_hint(domain_or_err or "")
+
+    if not domain or not is_valid_registrable_domain(domain):
+        await update.message.reply_text(
+            "Usage: /remove_bad_domain <domain>\n"
+            "Example: /remove_bad_domain phys.org\n\n"
+            "Or send /remove_bad_domain right after a blocked article URL."
+        )
+        return
+
+    bad = load_bad_domains(config.DOMAINS_BAD_FILE)
+    if domain not in bad:
+        await update.message.reply_text("Domain not on the bad list.")
+        return
+    bad.discard(domain)
+    save_bad_domains(config.DOMAINS_BAD_FILE, bad)
+    context.user_data.pop("last_bad_domain", None)
+    await update.message.reply_text(
+        f"Removed {domain} from the bad list. "
+        "Use /add_domain if you want it on the approved list again."
+    )
+
+
+async def cmd_override_bad_domain(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Temporarily allow a bad-list domain for troubleshooting (does not edit domains_bad.json)."""
+    if not update.effective_user or not update.message:
+        return
+    if not _allowed_user(update.effective_user.id):
+        await update.message.reply_text("You are not authorized.")
+        return
+
+    args = context.args or []
+    pending = context.user_data.get("last_bad_domain") or {}
+    url: str | None = None
+    domain: str | None = None
+
+    if args:
+        arg = args[0].strip()
+        if arg.lower().startswith("http://") or arg.lower().startswith("https://"):
+            url = arg
+            domain = registrable_domain_from_url(url)
+        else:
+            domain = normalize_registrable_hint(arg)
+            if len(args) > 1:
+                maybe_url = args[1].strip()
+                if maybe_url.lower().startswith("http://") or maybe_url.lower().startswith(
+                    "https://"
+                ):
+                    url = maybe_url
+    else:
+        url = pending.get("url")
+        domain = pending.get("domain")
+
+    if not domain or not is_valid_registrable_domain(domain):
+        await update.message.reply_text(
+            "Usage: /override_bad_domain <domain>\n"
+            "Example: /override_bad_domain phys.org\n\n"
+            "Or send /override_bad_domain right after a blocked article URL "
+            "(retries that link without removing it from the bad list).\n"
+            "You can also pass the full URL:\n"
+            "/override_bad_domain https://phys.org/news/..."
+        )
+        return
+
+    overrides: set[str] = context.user_data.setdefault("bad_domain_overrides", set())
+    overrides.add(domain)
+
+    await update.message.reply_text(
+        f"Temporary override enabled for {domain} (this session only; "
+        "domains_bad.json is unchanged). "
+        + ("Fetching article…" if url else "Send the article URL to fetch it.")
+    )
+
+    if url:
+        await _deliver_user_url_fetch(
+            update,
+            context,
+            url,
+            offer_domain_prompt=False,
+            ignore_bad_domain=True,
+        )
+
+
 async def _reply_on_chat(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -951,13 +1393,42 @@ async def _deliver_user_url_fetch(
     url: str,
     *,
     offer_domain_prompt: bool,
+    domain_trial: str | None = None,
+    ignore_bad_domain: bool = False,
 ) -> None:
     _purge_expired_pending()
     client: httpx.AsyncClient = context.application.bot_data["http_client"]
-    domains = load_domains(config.DOMAINS_FILE)
+    domains = set(load_domains(config.DOMAINS_FILE))
+    bad_domains = load_bad_domains(config.DOMAINS_BAD_FILE)
+    overrides: set[str] = context.user_data.get("bad_domain_overrides") or set()
     chat = update.effective_chat
     if not chat:
         return
+
+    trial_domain = domain_trial or registrable_domain_from_url(url)
+    host = (urlparse(url).hostname or "").lower()
+    overridden = bool(
+        ignore_bad_domain
+        or (host and host_allowed(host, overrides))
+        or (trial_domain and trial_domain in overrides)
+    )
+    if host and host_is_bad(host, bad_domains) and not overridden:
+        label = trial_domain or host
+        if update.effective_user:
+            context.user_data["last_bad_domain"] = {
+                "url": url,
+                "domain": label if is_valid_registrable_domain(label) else host,
+            }
+        await _reply_on_chat(
+            update,
+            context,
+            bad_domain_refusal_message(label, for_bot=True),
+        )
+        return
+
+    if overridden and trial_domain and is_valid_registrable_domain(trial_domain):
+        domains.add(trial_domain)
+
     await context.bot.send_chat_action(chat_id=chat.id, action="typing")
     try:
         result = await fetch_url(
@@ -980,6 +1451,19 @@ async def _deliver_user_url_fetch(
             domain = registrable_domain_from_url(reject)
             if domain and is_valid_registrable_domain(domain):
                 current = load_domains(config.DOMAINS_FILE)
+                bad = load_bad_domains(config.DOMAINS_BAD_FILE)
+                if domain in bad and domain not in overrides:
+                    if update.effective_user:
+                        context.user_data["last_bad_domain"] = {
+                            "url": url,
+                            "domain": domain,
+                        }
+                    await _reply_on_chat(
+                        update,
+                        context,
+                        bad_domain_refusal_message(domain, for_bot=True),
+                    )
+                    return
                 if domain not in current and update.effective_user:
                     _, kb = _pending_domain_put(
                         update.effective_user.id,
@@ -994,7 +1478,16 @@ async def _deliver_user_url_fetch(
                         reply_markup=kb,
                     )
                     return
-        await _reply_on_chat(update, context, _fetch_error_reply(e))
+        err_text = _fetch_error_reply(e)
+        await _reply_on_chat(update, context, err_text)
+        if domain_trial:
+            await _offer_mark_domain_bad(
+                update,
+                context,
+                domain=domain_trial,
+                url=url,
+                reason=err_text,
+            )
         return
     except (httpx.HTTPError, OSError) as e:
         logger.exception("fetch failed")
@@ -1033,6 +1526,7 @@ async def _deliver_user_url_fetch(
             result.content,
             result.final_url,
             result.content_type,
+            domain_trial=domain_trial,
         )
 
 
@@ -1187,14 +1681,16 @@ async def _run_speak(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await _bot_send_text(
         update,
         context,
-        "Generating audio… this may take a few minutes. "
+        "🎵Generating audio… this may take a few minutes. "
         "You can fetch another article while you wait.",
         chat_id=chat_id,
     )
     await context.bot.send_chat_action(chat_id=chat_id, action="upload_audio")
 
+    source_domain = registrable_domain_from_url(cached.url)
     config.AUDIO_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = config.AUDIO_OUTPUT_DIR / f"{user_id}_{int(time.time())}.mp3"
+    out_name = telegram_audio_filename(source_domain, cached.title)
+    out_path = config.AUDIO_OUTPUT_DIR / f"{user_id}_{int(time.time())}_{out_name}"
 
     try:
         await asyncio.to_thread(
@@ -1202,7 +1698,7 @@ async def _run_speak(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             cached.text,
             out_path,
             title=cached.title,
-            source_domain=registrable_domain_from_url(cached.url),
+            source_domain=source_domain,
         )
     except Exception as e:
         logger.exception("TTS failed")
@@ -1214,11 +1710,14 @@ async def _run_speak(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     total = len(parts)
     for i, part in enumerate(parts, start=1):
         part_title = f"{title} ({i}/{total})" if total > 1 else title
+        filename = telegram_audio_filename(
+            source_domain, cached.title, part=i, total=total
+        )
         try:
             with part.open("rb") as audio_file:
                 await context.bot.send_audio(
                     chat_id,
-                    audio=audio_file,
+                    audio=InputFile(audio_file, filename=filename),
                     title=part_title,
                     performer="News Catcher",
                 )
@@ -1228,7 +1727,7 @@ async def _run_speak(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     await context.bot.send_message(
         chat_id,
-        "Anything sound wrong? Tap Fix a word to tune pronunciation.",
+        "🎵Anything sound wrong? Tap Fix a word to tune pronunciation.",
         reply_markup=_after_audio_keyboard(),
     )
 
@@ -1284,10 +1783,11 @@ async def _send_pronunciation_samples(
         f"Generating {len(alternatives)} sample(s) for {from_text!r}…",
     )
     config.AUDIO_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    batch_id = secrets.token_hex(8)
+    PRONUNCIATION_BATCHES[batch_id] = []
 
     for alt in alternatives:
-        token = _pending_pronunciation_put(user_id, from_text, alt)
-        out_path = config.AUDIO_OUTPUT_DIR / f"pronounce_{user_id}_{token}.mp3"
+        out_path = config.AUDIO_OUTPUT_DIR / f"pronounce_{user_id}_{secrets.token_hex(4)}.mp3"
         try:
             await asyncio.to_thread(
                 synthesize_pronunciation_sample,
@@ -1296,7 +1796,6 @@ async def _send_pronunciation_samples(
             )
         except Exception as e:
             logger.exception("pronunciation sample failed")
-            _pending_pronunciation_remove(token)
             await context.bot.send_message(
                 chat_id,
                 f"Could not synthesize {alt!r}: {e}",
@@ -1306,26 +1805,46 @@ async def _send_pronunciation_samples(
         label = f"Save: {from_text!r} → {alt!r}"
         if len(label) > 60:
             label = f"Save → {alt!r}"
-        keyboard = InlineKeyboardMarkup(
-            [[InlineKeyboardButton(label, callback_data=f"r:{token}")]]
-        )
         try:
             with out_path.open("rb") as audio_file:
-                await context.bot.send_audio(
+                sent = await context.bot.send_audio(
                     chat_id,
                     audio=audio_file,
                     title=f"Pronounce: {alt}",
                     caption=(
                         f"Hear how {alt!r} sounds.\n"
                         f"Tap Save to write {from_text!r} → {alt!r} "
-                        f"in tts_replacements.json."
+                        f"in tts_replacements.json (whole word).\n"
+                        f"Use Save · ignore case for case-insensitive matching."
                     ),
-                    reply_markup=keyboard,
                 )
         except TelegramError as e:
             await context.bot.send_message(chat_id, f"Could not send sample for {alt!r}: {e}")
+            continue
         finally:
             out_path.unlink(missing_ok=True)
+
+        token = _pending_pronunciation_put(
+            user_id,
+            from_text,
+            alt,
+            chat_id=chat_id,
+            message_id=sent.message_id,
+            batch_id=batch_id,
+        )
+        PRONUNCIATION_BATCHES[batch_id].append((token, chat_id, sent.message_id))
+        save_row = [
+            InlineKeyboardButton(label, callback_data=f"r:{token}"),
+            InlineKeyboardButton("Save · ignore case", callback_data=f"ri:{token}"),
+        ]
+        try:
+            await context.bot.edit_message_reply_markup(
+                chat_id=chat_id,
+                message_id=sent.message_id,
+                reply_markup=InlineKeyboardMarkup([save_row]),
+            )
+        except TelegramError:
+            pass
 
 
 async def _run_word_fix_for_text(
@@ -1475,6 +1994,213 @@ async def cmd_add_pronunciation(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
 
+async def cmd_find_pronunciation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Search tts_replacements.json for similar rules; offer pronounce / delete."""
+    if not update.effective_user or not update.message:
+        return
+    if not _allowed_user(update.effective_user.id):
+        await update.message.reply_text("You are not authorized.")
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "Usage: /find_pronunciation <word or fragment>\n\n"
+            "Example: /find_pronunciation US\n"
+            "Shows the closest saved rules. You can hear them or delete them."
+        )
+        return
+
+    query = " ".join(args).strip()
+    matches = find_literal_replacements(query, limit=8)
+    if not matches:
+        await update.message.reply_text(
+            f"No saved rules close to {query!r}.\n"
+            "Try /pronounce to create one, or /add_pronunciation <from> <to>."
+        )
+        return
+
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if chat_id is None:
+        return
+
+    lines = [f"Closest rules for {query!r}:"]
+    rows: list[list[InlineKeyboardButton]] = []
+    match_pairs: list[tuple[str, str]] = []
+    for i, rule in enumerate(matches, start=1):
+        lines.append(f"{i}. {rule.from_text!r} → {rule.to_text!r}")
+        match_pairs.append((rule.from_text, rule.to_text))
+        token = _pending_rule_action_put(user_id, rule.from_text, rule.to_text)
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"Pronounce {i}", callback_data=f"rp:{token}"
+                ),
+                InlineKeyboardButton(
+                    f"Delete {i}", callback_data=f"rd:{token}"
+                ),
+            ]
+        )
+
+    session = _pending_find_session_put(user_id, match_pairs)
+    rows.append(
+        [
+            InlineKeyboardButton("Yes — pronounce any", callback_data=f"ra:{session}"),
+            InlineKeyboardButton("No", callback_data=f"rn:{session}"),
+        ]
+    )
+    await update.message.reply_text(
+        "\n".join(lines) + "\n\nPronounce any of these?",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def cmd_delete_pronunciation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not _allowed_user(update.effective_user.id):
+        await update.message.reply_text("You are not authorized.")
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "Usage: /delete_pronunciation <from>\n"
+            "Example: /delete_pronunciation a.m.\n\n"
+            "Or use /find_pronunciation <word> and tap Delete."
+        )
+        return
+    from_text = " ".join(args).strip()
+    # Exact delete first; if missing, offer closest matches.
+    try:
+        removed = remove_literal_replacement(from_text)
+    except ValueError as e:
+        await update.message.reply_text(str(e))
+        return
+    if removed:
+        await update.message.reply_text(
+            f"Deleted rule for {from_text!r} from {config.TTS_REPLACEMENTS_FILE.resolve()}"
+        )
+        return
+
+    matches = find_literal_replacements(from_text, limit=5)
+    if not matches:
+        await update.message.reply_text(f"No rule found for {from_text!r}.")
+        return
+    lines = [
+        f"No exact rule for {from_text!r}. Closest matches — tap Delete, "
+        "or retry with the exact `from` text:"
+    ]
+    rows: list[list[InlineKeyboardButton]] = []
+    for i, rule in enumerate(matches, start=1):
+        lines.append(f"{i}. {rule.from_text!r} → {rule.to_text!r}")
+        token = _pending_rule_action_put(
+            update.effective_user.id, rule.from_text, rule.to_text
+        )
+        rows.append(
+            [InlineKeyboardButton(f"Delete {i}", callback_data=f"rd:{token}")]
+        )
+    await update.message.reply_text(
+        "\n".join(lines), reply_markup=InlineKeyboardMarkup(rows)
+    )
+
+
+async def on_rule_action_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    if not query or not query.data or not update.effective_user:
+        return
+    if not _allowed_user(update.effective_user.id):
+        await query.answer("Not authorized.", show_alert=True)
+        return
+
+    data = query.data
+    if data.startswith("ra:") or data.startswith("rn:"):
+        session = _pending_find_session_get(data[3:])
+        if session is None:
+            await query.answer("Session expired. Run /find_pronunciation again.", show_alert=True)
+            return
+        if session.user_id != update.effective_user.id:
+            await query.answer("Not your request.", show_alert=True)
+            return
+        await query.answer()
+        chat_id = _action_chat_id(update)
+        if chat_id is None:
+            return
+        if data.startswith("rn:"):
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except TelegramError:
+                pass
+            await context.bot.send_message(
+                chat_id,
+                "Okay — use Delete on a row above if you want to remove a rule.",
+            )
+            return
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except TelegramError:
+            pass
+        await context.bot.send_message(chat_id, "Generating samples for matched rules…")
+        for from_text, to_text in session.matches:
+            await _send_pronunciation_samples(
+                context,
+                chat_id=chat_id,
+                user_id=session.user_id,
+                from_text=from_text,
+                alternatives=[to_text],
+            )
+        return
+
+    if not (data.startswith("rp:") or data.startswith("rd:")):
+        return
+    action = data[:2]
+    token = data[3:]
+    pending = _pending_rule_action_get(token)
+    if pending is None:
+        await query.answer("Expired. Run /find_pronunciation again.", show_alert=True)
+        return
+    if pending.user_id != update.effective_user.id:
+        await query.answer("Not your request.", show_alert=True)
+        return
+
+    await query.answer()
+    chat_id = _action_chat_id(update)
+    if chat_id is None:
+        return
+
+    if action == "rd":
+        PENDING_RULE_ACTION.pop(token, None)
+        try:
+            removed = remove_literal_replacement(pending.from_text)
+        except ValueError as e:
+            await context.bot.send_message(chat_id, str(e))
+            return
+        if removed:
+            await context.bot.send_message(
+                chat_id,
+                f"Deleted {pending.from_text!r} → {pending.to_text!r}",
+            )
+        else:
+            await context.bot.send_message(
+                chat_id, f"Rule {pending.from_text!r} was already gone."
+            )
+        return
+
+    # pronounce one
+    await context.bot.send_message(
+        chat_id,
+        f"Playing saved pronunciation:\n  {pending.from_text!r} → {pending.to_text!r}",
+    )
+    await _send_pronunciation_samples(
+        context,
+        chat_id=chat_id,
+        user_id=pending.user_id,
+        from_text=pending.from_text,
+        alternatives=[pending.to_text],
+    )
+
+
 async def cmd_pronounce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Generate short audio samples for spelling alternatives; save via inline button."""
     if not update.effective_user or not update.message:
@@ -1552,9 +2278,15 @@ async def on_pronunciation_callback(
     query = update.callback_query
     if not query or not query.data or not update.effective_user:
         return
-    if not query.data.startswith("r:"):
+    data = query.data
+    if data.startswith("ri:"):
+        ignore_case = True
+        token = data[3:]
+    elif data.startswith("r:"):
+        ignore_case = False
+        token = data[2:]
+    else:
         return
-    token = query.data[2:]
     pending = _pending_pronunciation_get(token)
     if pending is None:
         await query.answer("This sample expired. Run /pronounce again.", show_alert=True)
@@ -1565,18 +2297,28 @@ async def on_pronunciation_callback(
 
     await query.answer()
     _pending_pronunciation_remove(token)
+    await _delete_other_pronunciation_samples(
+        context, batch_id=pending.batch_id, keep_token=token
+    )
     try:
-        added = add_literal_replacement(pending.from_text, pending.to_text)
+        added = add_literal_replacement(
+            pending.from_text,
+            pending.to_text,
+            whole_word=True,
+            ignore_case=ignore_case,
+        )
     except ValueError as e:
         await query.edit_message_caption(caption=f"Failed to save: {e}")
         return
 
     path = config.TTS_REPLACEMENTS_FILE.resolve()
     verb = "Added" if added else "Updated"
+    case_note = "ignore case" if ignore_case else "case sensitive"
     await query.edit_message_caption(
         caption=(
             f"{verb} in tts_replacements.json:\n"
             f"  {pending.from_text!r} → {pending.to_text!r}\n"
+            f"  whole word · {case_note}\n"
             f"File: {path}\n\n"
             "Tap Test phrase or send /speak <sentence> to hear it spoken."
         ),
@@ -1833,7 +2575,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if pending_word.step == "after_samples":
             await update.message.reply_text(
                 "Tap Retry, Send feedback, or My spelling on the message above, "
-                "or send /fixaword to start over."
+                "or send /nevermind to cancel and wait for the next URL."
             )
             return
 
@@ -1866,6 +2608,336 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     _pending_word_fix_clear(user_id)
     _pending_speak_phrase_clear(user_id)
     await _deliver_user_url_fetch(update, context, url, offer_domain_prompt=True)
+
+
+def _watch_interval_default() -> int:
+    return max(
+        5,
+        int(
+            getattr(
+                config,
+                "WATCHLIST_DEFAULT_INTERVAL_MINUTES",
+                DEFAULT_CHECK_INTERVAL_MINUTES,
+            )
+        ),
+    )
+
+
+async def cmd_watch_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not _allowed_user(update.effective_user.id):
+        await update.message.reply_text("You are not authorized.")
+        return
+    if not config.WATCHLIST_ENABLED:
+        await update.message.reply_text("Watchlist is disabled (WATCHLIST_ENABLED=0).")
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "Usage: /watch_add <website> [check_interval_minutes]\n\n"
+            "Example:\n"
+            "  /watch_add hackaday.com\n"
+            "  /watch_add marktechpost.com 120\n\n"
+            "I will poll the site's RSS/Atom feed (or WordPress API) and notify you "
+            "when new posts appear. Default interval: "
+            f"{_watch_interval_default()} minutes."
+        )
+        return
+
+    domain = domain_hint_from_user_input(args[0])
+    if not domain or not is_valid_registrable_domain(domain):
+        await update.message.reply_text(
+            "Could not parse a domain. Try: /watch_add example.com"
+        )
+        return
+    domain = normalize_registrable_hint(domain)
+
+    interval = _watch_interval_default()
+    if len(args) >= 2:
+        try:
+            interval = int(args[1])
+        except ValueError:
+            await update.message.reply_text("Interval must be minutes as an integer.")
+            return
+
+    existing = get_site(config.WATCHLIST_FILE, domain)
+    site = WatchedSite(
+        domain=domain,
+        check_interval_minutes=interval,
+        feed_url=existing.feed_url if existing else None,
+        last_checked_at=existing.last_checked_at if existing else 0.0,
+        posts=list(existing.posts) if existing else [],
+    )
+    upsert_site(config.WATCHLIST_FILE, site)
+
+    # Ensure fetch/read works for this host.
+    approved = load_domains(config.DOMAINS_FILE)
+    if domain not in approved:
+        approved.add(domain)
+        save_domains(config.DOMAINS_FILE, approved)
+
+    await update.message.reply_text(
+        f"Watching {domain} every {site.check_interval_minutes} minutes.\n"
+        f"Also added to approved domains if needed.\n"
+        f"Saved to {config.WATCHLIST_FILE.resolve()}\n\n"
+        "First check seeds recent posts without notifications. "
+        "Use /watch_check to poll now."
+    )
+
+
+async def cmd_watch_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not _allowed_user(update.effective_user.id):
+        await update.message.reply_text("You are not authorized.")
+        return
+    sites = load_watchlist(config.WATCHLIST_FILE)
+    if not sites:
+        await update.message.reply_text(
+            "No watched sites. Add one with /watch_add example.com"
+        )
+        return
+    lines = ["Watched blogs:"]
+    for site in sites:
+        feed = site.feed_url or "(auto-discover)"
+        lines.append(
+            f"• {site.domain} — every {site.check_interval_minutes} min, "
+            f"{len(site.posts)} posts remembered\n  feed: {feed}"
+        )
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_watch_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not _allowed_user(update.effective_user.id):
+        await update.message.reply_text("You are not authorized.")
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Usage: /watch_remove <website>")
+        return
+    domain = domain_hint_from_user_input(args[0])
+    if not domain:
+        await update.message.reply_text("Could not parse domain.")
+        return
+    domain = normalize_registrable_hint(domain)
+    if remove_site(config.WATCHLIST_FILE, domain):
+        await update.message.reply_text(f"Stopped watching {domain}.")
+    else:
+        await update.message.reply_text(f"{domain} is not on the watchlist.")
+
+
+async def cmd_watch_interval(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not _allowed_user(update.effective_user.id):
+        await update.message.reply_text("You are not authorized.")
+        return
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Usage: /watch_interval <website> <minutes>\n"
+            "Example: /watch_interval hackaday.com 45"
+        )
+        return
+    domain = domain_hint_from_user_input(args[0])
+    if not domain:
+        await update.message.reply_text("Could not parse domain.")
+        return
+    domain = normalize_registrable_hint(domain)
+    try:
+        minutes = int(args[1])
+    except ValueError:
+        await update.message.reply_text("Minutes must be an integer.")
+        return
+    site = set_interval(config.WATCHLIST_FILE, domain, minutes)
+    if site is None:
+        await update.message.reply_text(f"{domain} is not on the watchlist.")
+        return
+    await update.message.reply_text(
+        f"{domain} will be checked every {site.check_interval_minutes} minutes."
+    )
+
+
+async def cmd_watch_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not _allowed_user(update.effective_user.id):
+        await update.message.reply_text("You are not authorized.")
+        return
+    if not config.WATCHLIST_ENABLED:
+        await update.message.reply_text("Watchlist is disabled.")
+        return
+    await update.message.reply_text("Checking watched sites now…")
+    await _run_watchlist_checks(context.application, force=True)
+
+
+async def _notify_watch_post(
+    app: Application,
+    *,
+    user_id: int,
+    site_domain: str,
+    post: CandidatePost,
+) -> None:
+    token = _pending_watch_post_put(user_id, post.url, post.title)
+    kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Read", callback_data=f"wr:{token}"),
+                InlineKeyboardButton("Speak", callback_data=f"ws:{token}"),
+            ]
+        ]
+    )
+    title_html = f"<b>{html_module.escape(post.title)}</b>"
+    body = first_paragraph(post.summary) or "(No summary available.)"
+    text = (
+        f"{title_html}\n\n{html_module.escape(body)}\n\n"
+        f"{html_module.escape(site_domain)}\n{html_module.escape(post.url)}"
+    )
+    try:
+        await app.bot.send_message(
+            chat_id=user_id,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=kb,
+            disable_web_page_preview=True,
+        )
+    except TelegramError as e:
+        logger.warning("Watch notify failed for user %s: %s", user_id, e)
+
+
+async def _run_watchlist_checks(app: Application, *, force: bool = False) -> None:
+    if not config.WATCHLIST_ENABLED:
+        return
+    sites = load_watchlist(config.WATCHLIST_FILE)
+    if not sites:
+        return
+    client: httpx.AsyncClient | None = app.bot_data.get("http_client")
+    if client is None:
+        return
+
+    for site in sites:
+        if not force and not site_is_due(site):
+            continue
+        result = await check_site(client, site)
+        upsert_site(config.WATCHLIST_FILE, result.site)
+        if result.error and force:
+            for uid in sorted(config.ALLOWED_TELEGRAM_USER_IDS):
+                try:
+                    await app.bot.send_message(
+                        chat_id=uid,
+                        text=f"Watch check for {site.domain}: {result.error}",
+                    )
+                except TelegramError:
+                    pass
+        for post in result.new_posts:
+            for uid in sorted(config.ALLOWED_TELEGRAM_USER_IDS):
+                await _notify_watch_post(
+                    app, user_id=uid, site_domain=result.site.domain, post=post
+                )
+
+
+async def _watchlist_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _run_watchlist_checks(context.application, force=False)
+
+
+async def _watchlist_loop(app: Application) -> None:
+    await asyncio.sleep(min(45, config.WATCHLIST_TICK_SECONDS))
+    while True:
+        try:
+            await _run_watchlist_checks(app, force=False)
+        except Exception:
+            logger.exception("watchlist loop failed")
+        await asyncio.sleep(max(15, config.WATCHLIST_TICK_SECONDS))
+
+
+async def _fetch_article_into_cache(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    url: str,
+    *,
+    user_id: int,
+) -> str | None:
+    """Fetch and cache an article; return error message or None on success."""
+    client: httpx.AsyncClient = context.application.bot_data["http_client"]
+    domains = load_domains(config.DOMAINS_FILE)
+    try:
+        result = await fetch_url(
+            client,
+            url,
+            config.FETCH_SOFT_MAX_BYTES,
+            domains,
+            allow_http=config.ALLOW_HTTP,
+            max_redirects=config.MAX_REDIRECTS,
+            user_agent=config.USER_AGENT,
+        )
+    except FetchError as e:
+        return _fetch_error_reply(e)
+    except (httpx.HTTPError, OSError) as e:
+        return f"Network error: {e}"
+
+    if not isinstance(result, FetchOk):
+        return "Article is large — paste the URL to fetch with oversize confirmation."
+
+    try:
+        article = extract_article(result.content, result.final_url)
+    except Exception as e:
+        return f"Could not extract article text: {e}"
+    if not article.text.strip():
+        return "No article body found."
+    save_last_article(
+        config.ARTICLE_CACHE_DIR,
+        user_id,
+        result.final_url,
+        article.title,
+        article.text,
+    )
+    return None
+
+
+async def on_watch_post_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    if not query or not query.data or not update.effective_user:
+        return
+    if not _allowed_user(update.effective_user.id):
+        await query.answer("Not authorized.", show_alert=True)
+        return
+    data = query.data
+    if not (data.startswith("wr:") or data.startswith("ws:")):
+        return
+    pending = _pending_watch_post_get(data[3:])
+    if pending is None:
+        await query.answer("This post expired. Wait for the next watch notify.", show_alert=True)
+        return
+    if pending.user_id != update.effective_user.id:
+        await query.answer("Not your request.", show_alert=True)
+        return
+
+    await query.answer()
+    chat_id = _action_chat_id(update)
+    if chat_id is None:
+        return
+
+    if data.startswith("wr:"):
+        await context.bot.send_message(chat_id, f"Reading: {pending.title}")
+        await _deliver_user_url_fetch(
+            update, context, pending.url, offer_domain_prompt=True
+        )
+        return
+
+    # Speak
+    await context.bot.send_message(chat_id, f"Fetching for audio: {pending.title}")
+    err = await _fetch_article_into_cache(
+        update, context, pending.url, user_id=pending.user_id
+    )
+    if err:
+        await context.bot.send_message(chat_id, err)
+        return
+    _schedule_speak(update, context)
 
 
 async def on_domain_add_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1919,7 +2991,58 @@ async def on_domain_add_callback(update: Update, context: ContextTypes.DEFAULT_T
     current.add(domain)
     save_domains(config.DOMAINS_FILE, current)
     await query.edit_message_text(f"Added {domain}. Fetching…")
-    await _deliver_user_url_fetch(update, context, pending.url, offer_domain_prompt=False)
+    await _deliver_user_url_fetch(
+        update,
+        context,
+        pending.url,
+        offer_domain_prompt=False,
+        domain_trial=domain,
+    )
+
+
+async def on_domain_bad_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    if not query or not query.data or not update.effective_user:
+        return
+    _purge_expired_pending()
+    data = query.data
+    if len(data) < 3 or data[1] != ":":
+        await query.answer()
+        return
+    action, token = data[0], data[2:]
+    if action not in ("b", "k"):
+        return
+
+    pending = _pending_domain_bad_get(token)
+    if pending is None:
+        await query.answer("This confirmation expired.", show_alert=True)
+        return
+    if pending.user_id != update.effective_user.id:
+        await query.answer("Not your request.", show_alert=True)
+        return
+
+    await query.answer()
+    _pending_domain_bad_remove(token)
+
+    if action == "k":
+        await query.edit_message_text(
+            f"Kept {pending.domain} on the approved list. "
+            "You can retry the URL or use /fix_403 if blocked."
+        )
+        return
+
+    domain = normalize_registrable_hint(pending.domain)
+    if not is_valid_registrable_domain(domain):
+        await query.edit_message_text("Invalid domain; not changed.")
+        return
+
+    add_bad_domain(config.DOMAINS_BAD_FILE, config.DOMAINS_FILE, domain)
+    await query.edit_message_text(
+        f"Blocked {domain} and removed it from the approved list.\n"
+        f"Saved to {config.DOMAINS_BAD_FILE.resolve()}"
+    )
 
 
 async def on_oversize_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1998,12 +3121,61 @@ async def on_oversize_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def _post_init(app: Application) -> None:
     config.ARTICLE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    config.WATCHLIST_FILE.parent.mkdir(parents=True, exist_ok=True)
     config.ensure_test_articles_dir()
     purge_article_cache(config.ARTICLE_CACHE_DIR, config.LAST_ARTICLE_TTL_SECONDS)
     app.bot_data["http_client"] = httpx.AsyncClient(
         timeout=httpx.Timeout(config.FETCH_TIMEOUT_SECONDS),
         follow_redirects=False,
     )
+    try:
+        await app.bot.set_my_commands(
+            [
+                BotCommand("start", "Help and how to use the bot"),
+                BotCommand("speak", "Test a phrase with current pronunciations"),
+                BotCommand("fixaword", "Fix a mispronounced word in the last audio"),
+                BotCommand("pronounce", "Preview pronunciation samples for a word"),
+                BotCommand("find_pronunciation", "Find saved rules; pronounce or delete"),
+                BotCommand("delete_pronunciation", "Delete a pronunciation rule"),
+                BotCommand("add_pronunciation", "Add a pronunciation rule (no audio)"),
+                BotCommand("nevermind", "Cancel in-progress prompts; wait for URL"),
+                BotCommand("watch_add", "Watch a blog for new posts"),
+                BotCommand("watch_list", "List watched blogs"),
+                BotCommand("watch_remove", "Stop watching a blog"),
+                BotCommand("watch_interval", "Set how often to check a blog"),
+                BotCommand("watch_check", "Check watched blogs now"),
+                BotCommand("list_domains", "List approved news domains"),
+                BotCommand("add_domain", "Add an approved domain"),
+                BotCommand("remove_domain", "Remove an approved domain"),
+                BotCommand("list_bad_domains", "List domains marked as bad"),
+                BotCommand("remove_bad_domain", "Remove a domain from the bad list"),
+                BotCommand(
+                    "override_bad_domain",
+                    "Temporarily allow a bad domain (troubleshooting)",
+                ),
+                BotCommand("fix_403", "Tips for sites that block the bot"),
+            ]
+        )
+    except TelegramError as e:
+        logger.warning("set_my_commands failed: %s", e)
+
+    if config.WATCHLIST_ENABLED:
+        if app.job_queue is not None:
+            app.job_queue.run_repeating(
+                _watchlist_job,
+                interval=max(15, config.WATCHLIST_TICK_SECONDS),
+                first=45,
+                name="watchlist",
+            )
+        else:
+            logger.warning(
+                "JobQueue unavailable; install python-telegram-bot[job-queue]. "
+                "Starting asyncio watchlist loop instead."
+            )
+            app.bot_data["watchlist_task"] = asyncio.create_task(
+                _watchlist_loop(app), name="watchlist-loop"
+            )
+
     text = "News Catcher bot is online and ready."
     for uid in sorted(config.ALLOWED_TELEGRAM_USER_IDS):
         try:
@@ -2018,6 +3190,11 @@ async def _post_shutdown(app: Application) -> None:
         task.cancel()
     if speak_tasks:
         await asyncio.gather(*speak_tasks, return_exceptions=True)
+
+    watch_task: asyncio.Task | None = app.bot_data.get("watchlist_task")
+    if watch_task is not None:
+        watch_task.cancel()
+        await asyncio.gather(watch_task, return_exceptions=True)
 
     client: httpx.AsyncClient = app.bot_data.get("http_client")
     if client:
@@ -2045,15 +3222,29 @@ def main() -> None:
     app.add_handler(CommandHandler("list_domains", cmd_list_domains))
     app.add_handler(CommandHandler("add_domain", cmd_add_domain))
     app.add_handler(CommandHandler("remove_domain", cmd_remove_domain))
+    app.add_handler(CommandHandler("list_bad_domains", cmd_list_bad_domains))
+    app.add_handler(CommandHandler("remove_bad_domain", cmd_remove_bad_domain))
+    app.add_handler(CommandHandler("override_bad_domain", cmd_override_bad_domain))
     app.add_handler(CommandHandler("fix_403", cmd_fix_403))
     app.add_handler(CommandHandler("pronounce", cmd_pronounce))
     app.add_handler(CommandHandler("add_pronunciation", cmd_add_pronunciation))
+    app.add_handler(CommandHandler("find_pronunciation", cmd_find_pronunciation))
+    app.add_handler(CommandHandler("delete_pronunciation", cmd_delete_pronunciation))
     app.add_handler(CommandHandler("fixaword", cmd_fixaword))
     app.add_handler(CommandHandler("speak", cmd_speak))
-    app.add_handler(CallbackQueryHandler(on_pronunciation_callback, pattern=r"^r:"))
+    app.add_handler(CommandHandler("nevermind", cmd_nevermind))
+    app.add_handler(CommandHandler("watch_add", cmd_watch_add))
+    app.add_handler(CommandHandler("watch_list", cmd_watch_list))
+    app.add_handler(CommandHandler("watch_remove", cmd_watch_remove))
+    app.add_handler(CommandHandler("watch_interval", cmd_watch_interval))
+    app.add_handler(CommandHandler("watch_check", cmd_watch_check))
+    app.add_handler(CallbackQueryHandler(on_pronunciation_callback, pattern=r"^ri?:"))
+    app.add_handler(CallbackQueryHandler(on_rule_action_callback, pattern=r"^r[pdna]:"))
     app.add_handler(CallbackQueryHandler(on_speak_phrase_callback, pattern=r"^s:"))
     app.add_handler(CallbackQueryHandler(on_word_fix_callback, pattern=r"^wf:"))
+    app.add_handler(CallbackQueryHandler(on_watch_post_callback, pattern=r"^w[rs]:"))
     app.add_handler(CallbackQueryHandler(on_domain_add_callback, pattern=r"^[yn]:"))
+    app.add_handler(CallbackQueryHandler(on_domain_bad_callback, pattern=r"^[bk]:"))
     app.add_handler(CallbackQueryHandler(on_oversize_callback, pattern=r"^[px]:"))
     app.add_handler(CallbackQueryHandler(on_article_action_callback, pattern=r"^a:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))

@@ -32,6 +32,65 @@ def save_domains(path: Path, domains: Iterable[str]) -> None:
             f.write("\n")
 
 
+def load_bad_domains(path: Path) -> set[str]:
+    """Domains that could not deliver usable articles."""
+    if not path.exists():
+        return set()
+    with path.open(encoding="utf-8") as f:
+        data = json.load(f)
+    domains = data.get("domains", [])
+    if not isinstance(domains, list):
+        return set()
+    return {str(d).strip().lower() for d in domains if str(d).strip()}
+
+
+def save_bad_domains(path: Path, domains: Iterable[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    unique = sorted({d.strip().lower() for d in domains if d.strip()})
+    payload = {"domains": unique}
+    with _lock:
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+            f.write("\n")
+
+
+def add_bad_domain(
+    bad_path: Path,
+    good_path: Path,
+    domain: str,
+) -> None:
+    """Move a domain off the allowlist and onto the bad list."""
+    d = normalize_registrable_hint(domain)
+    bad = load_bad_domains(bad_path)
+    bad.add(d)
+    save_bad_domains(bad_path, bad)
+    good = load_domains(good_path)
+    good.discard(d)
+    save_domains(good_path, good)
+
+
+def host_is_bad(hostname: str, bad_domains: set[str]) -> bool:
+    """True if hostname matches a bad registrable domain or its subdomains."""
+    return host_allowed(hostname, bad_domains)
+
+
+def bad_domain_refusal_message(domain: str, *, for_bot: bool = True) -> str:
+    """User-facing text when a URL is refused because the domain is on the bad list."""
+    label = (domain or "").strip() or "This domain"
+    if for_bot:
+        return (
+            f"{label} is on your bad-domains list (article extraction failed before). "
+            "For troubleshooting you can temporarily override with /override_bad_domain "
+            "(does not remove it from the bad list). "
+            "Or permanently remove it with /remove_bad_domain."
+        )
+    return (
+        f"{label} is on your bad-domains list (article extraction failed before). "
+        "You can temporarily override to help with troubleshooting, "
+        "or remove it from domains_bad.json to try again permanently."
+    )
+
+
 def normalize_registrable_hint(domain: str) -> str:
     """Lowercase host label; caller validates format."""
     return domain.strip().lower().rstrip(".")

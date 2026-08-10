@@ -47,6 +47,118 @@
     {
       "from": "a.m.",
       "to": "A eM"
+    },
+    {
+      "from": "Ill.",
+      "to": "Illih-noi"
+    },
+    {
+      "from": "P.M.",
+      "to": "P eM"
+    },
+    {
+      "from": "D.C.",
+      "to": "D C"
+    },
+    {
+      "from": "Hotair.com",
+      "to": "Hot Air dot com"
+    },
+    {
+      "from": "HotAir's",
+      "to": "Hot Air's"
+    },
+    {
+      "from": "IRGC",
+      "to": "I-R-G-C"
+    },
+    {
+      "from": "EFF's",
+      "to": "E F F's"
+    },
+    {
+      "from": "polish",
+      "to": "poleish",
+      "whole_word": true,
+      "ignore_case": false
+    },
+    {
+      "from": "Polish",
+      "to": "Pole-ish",
+      "whole_word": true,
+      "ignore_case": false
+    },
+    {
+      "from": "NES",
+      "to": "N-E-S",
+      "whole_word": true,
+      "ignore_case": false
+    },
+    {
+      "from": "Tucson",
+      "to": "Too-sawn",
+      "whole_word": true,
+      "ignore_case": false
+    },
+    {
+      "from": "yourvalley",
+      "to": "your valley",
+      "whole_word": true,
+      "ignore_case": false
+    },
+    {
+      "from": "jellyfish",
+      "to": "jel-ee-fish",
+      "whole_word": true,
+      "ignore_case": false
+    },
+    {
+      "from": "thedailybeast",
+      "to": "the-daily-beast",
+      "whole_word": true,
+      "ignore_case": false
+    },
+    {
+      "from": "D-N.Y.",
+      "to": "Democrat of New York",
+      "whole_word": true,
+      "ignore_case": false
+    },
+    {
+      "from": "live",
+      "to": "Live",
+      "whole_word": true,
+      "ignore_case": false
+    },
+    {
+      "from": "3G",
+      "to": "Three Gee",
+      "whole_word": true,
+      "ignore_case": false
+    },
+    {
+      "from": "4G",
+      "to": "four-g",
+      "whole_word": true,
+      "ignore_case": false
+    },
+    {
+      "from": "5G",
+      "to": "Five Gee",
+      "whole_word": true,
+      "ignore_case": false
+    },
+    {
+      "from": "ICE",
+      "to": "ice",
+      "whole_word": true,
+      "ignore_case": false
+    },
+    {
+      "from": "US",
+      "to": "You-S",
+      "whole_word": true,
+      "ignore_case": false
     }
   ],
   "regex": [
