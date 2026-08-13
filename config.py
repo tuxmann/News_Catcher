@@ -19,11 +19,14 @@ def _int(name: str, default: int) -> int:
 
 
 def _bool(name: str, default: bool = False) -> bool:
-    raw = os.environ.get(name, "").strip().lower()
-    if raw in ("1", "true", "yes", "on"):
-        return True
-    if raw in ("0", "false", "no", "off", ""):
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
         return default
+    val = raw.strip().lower()
+    if val in ("1", "true", "yes", "on"):
+        return True
+    if val in ("0", "false", "no", "off"):
+        return False
     return default
 
 
@@ -42,6 +45,13 @@ if not DOMAINS_FILE.is_absolute():
 DOMAINS_BAD_FILE = Path(os.environ.get("DOMAINS_BAD_FILE", "domains_bad.json"))
 if not DOMAINS_BAD_FILE.is_absolute():
     DOMAINS_BAD_FILE = PROJECT_ROOT / DOMAINS_BAD_FILE
+# 1 = ask before adding unknown hosts to domains.json; 0 = auto-add them.
+ASK_ADD_DOMAIN = _bool("ASK_ADD_DOMAIN", True)
+ELIMINATE_PHRASES_FILE = Path(
+    os.environ.get("ELIMINATE_PHRASES_FILE", "data/eliminate_phrases.json")
+)
+if not ELIMINATE_PHRASES_FILE.is_absolute():
+    ELIMINATE_PHRASES_FILE = PROJECT_ROOT / ELIMINATE_PHRASES_FILE
 
 FETCH_SOFT_MAX_BYTES = _int("FETCH_SOFT_MAX_BYTES", 5 * 1024 * 1024)
 FETCH_HARD_MAX_BYTES = _int("FETCH_HARD_MAX_BYTES", 20 * 1024 * 1024)

@@ -287,6 +287,15 @@ def fetch_article(
                         ),
                     )
                 if domain not in current:
+                    if not config.ASK_ADD_DOMAIN:
+                        err = add_approved_domain(domain)
+                        if err:
+                            return FetchArticleOutcome(kind="error", error=err)
+                        return fetch_article(
+                            url,
+                            byte_limit=byte_limit,
+                            ignore_bad_domain=ignore_bad_domain,
+                        )
                     return FetchArticleOutcome(
                         kind="domain_prompt",
                         domain_prompt=DomainPrompt(

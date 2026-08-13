@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html as html_module
 import logging
 import re
 import time
@@ -59,6 +60,38 @@ def first_paragraph(text: str, *, max_chars: int = 600) -> str:
     if len(para) > max_chars:
         para = para[: max_chars - 1].rstrip() + "…"
     return para
+
+
+def format_site_digest(
+    domain: str,
+    posts: list[CandidatePost],
+    *,
+    max_chars: int = 3900,
+) -> str:
+    """One Telegram HTML message for all new posts from a site."""
+    count = len(posts)
+    heading = (
+        f"<b>{html_module.escape(domain)}</b> — "
+        f"{count} new post{'s' if count != 1 else ''}"
+    )
+    para_limit = 500
+    while para_limit >= 80:
+        blocks = [heading]
+        for i, post in enumerate(posts, start=1):
+            title = html_module.escape(post.title or post.url)
+            body = first_paragraph(post.summary, max_chars=para_limit) or (
+                "(No summary available.)"
+            )
+            blocks.append(f"<b>{i}. {title}</b>\n{html_module.escape(body)}")
+        text = "\n\n".join(blocks)
+        if len(text) <= max_chars:
+            return text
+        para_limit = int(para_limit * 0.7)
+    # Last resort: titles only.
+    lines = [heading]
+    for i, post in enumerate(posts, start=1):
+        lines.append(f"<b>{i}. {html_module.escape(post.title or post.url)}</b>")
+    return "\n".join(lines)[:max_chars]
 
 
 def _base_url(domain: str) -> str:

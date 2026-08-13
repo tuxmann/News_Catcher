@@ -6,6 +6,7 @@ import json
 import threading
 import time
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
@@ -13,7 +14,8 @@ _lock = threading.Lock()
 
 MAX_POSTS_PER_SITE = 20
 DEFAULT_CHECK_INTERVAL_MINUTES = 60
-MIN_CHECK_INTERVAL_MINUTES = 5
+MIN_CHECK_INTERVAL_MINUTES = 15
+ALLOWED_SUBHOUR_INTERVALS = (15, 30)
 
 
 @dataclass
@@ -35,8 +37,36 @@ class WatchedSite:
         return {p.url for p in self.posts}
 
 
+def normalize_check_interval(minutes: int) -> int:
+    """
+    Snap to 15, 30, or a whole-hour multiple (60, 120, …).
+    Hourly (and longer) checks run at the top of the hour.
+    """
+    m = int(minutes)
+    if m <= 22:
+        return 15
+    if m <= 44:
+        return 30
+    hours = max(1, (m + 30) // 60)
+    return hours * 60
+
+
 def _clamp_interval(minutes: int) -> int:
-    return max(MIN_CHECK_INTERVAL_MINUTES, int(minutes))
+    return normalize_check_interval(minutes)
+
+
+def current_slot_start(
+    interval_minutes: int, *, now: datetime | None = None
+) -> datetime:
+    """Most recent clock-aligned slot start at or before `now` (local time)."""
+    now = datetime.now() if now is None else now
+    interval = normalize_check_interval(interval_minutes)
+    if interval % 60 == 0:
+        hours = interval // 60
+        aligned_hour = (now.hour // hours) * hours
+        return now.replace(hour=aligned_hour, minute=0, second=0, microsecond=0)
+    aligned_min = (now.minute // interval) * interval
+    return now.replace(minute=aligned_min, second=0, microsecond=0)
 
 
 def _post_from_raw(raw: object) -> WatchedPost | None:
@@ -193,8 +223,25 @@ def merge_new_posts(site: WatchedSite, new_posts: list[WatchedPost]) -> list[Wat
     return added
 
 
-def site_is_due(site: WatchedSite, *, now: float | None = None) -> bool:
-    now = time.time() if now is None else now
+def site_is_due(
+    site: WatchedSite,
+    *,
+    now: float | datetime | None = None,
+) -> bool:
+    """
+    True if this site has not yet been checked in the current clock slot.
+
+    15 min → :00, :15, :30, :45
+    30 min → :00, :30
+    60+ min (multiples of 60) → top of the hour (every N hours from midnight)
+    """
     if site.last_checked_at <= 0:
         return True
-    return (now - site.last_checked_at) >= (site.check_interval_minutes * 60)
+    if isinstance(now, datetime):
+        dt = now
+    elif now is None:
+        dt = datetime.now()
+    else:
+        dt = datetime.fromtimestamp(now)
+    slot = current_slot_start(site.check_interval_minutes, now=dt)
+    return site.last_checked_at < slot.timestamp()

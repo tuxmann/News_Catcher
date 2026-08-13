@@ -4,14 +4,23 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 
-from watchlist import domain_hint_from_user_input, first_paragraph, strip_html_to_text
+from watchlist import (
+    CandidatePost,
+    domain_hint_from_user_input,
+    first_paragraph,
+    format_site_digest,
+    strip_html_to_text,
+)
 from watchlist_store import (
     WatchedPost,
     WatchedSite,
+    current_slot_start,
     load_watchlist,
     merge_new_posts,
+    normalize_check_interval,
     remove_site,
     site_is_due,
     upsert_site,
@@ -47,10 +56,47 @@ class TestWatchlistStore(unittest.TestCase):
         self.assertEqual(len(site.posts), 20)
         self.assertEqual(site.posts[0].url, "https://blog.test/new1")
 
-    def test_site_is_due(self) -> None:
-        site = WatchedSite(domain="x.com", check_interval_minutes=60, last_checked_at=1000)
-        self.assertFalse(site_is_due(site, now=1000 + 30 * 60))
-        self.assertTrue(site_is_due(site, now=1000 + 61 * 60))
+    def test_normalize_interval(self) -> None:
+        self.assertEqual(normalize_check_interval(15), 15)
+        self.assertEqual(normalize_check_interval(30), 30)
+        self.assertEqual(normalize_check_interval(10), 15)
+        self.assertEqual(normalize_check_interval(45), 60)
+        self.assertEqual(normalize_check_interval(75), 60)
+        self.assertEqual(normalize_check_interval(120), 120)
+
+    def test_slot_start_hourly(self) -> None:
+        now = datetime(2026, 8, 12, 10, 37, 12)
+        self.assertEqual(
+            current_slot_start(60, now=now),
+            datetime(2026, 8, 12, 10, 0, 0),
+        )
+        self.assertEqual(
+            current_slot_start(120, now=datetime(2026, 8, 12, 11, 5)),
+            datetime(2026, 8, 12, 10, 0, 0),
+        )
+
+    def test_slot_start_subhour(self) -> None:
+        now = datetime(2026, 8, 12, 10, 37, 12)
+        self.assertEqual(
+            current_slot_start(15, now=now),
+            datetime(2026, 8, 12, 10, 30, 0),
+        )
+        self.assertEqual(
+            current_slot_start(30, now=now),
+            datetime(2026, 8, 12, 10, 30, 0),
+        )
+
+    def test_site_is_due_clock_aligned(self) -> None:
+        slot = datetime(2026, 8, 12, 10, 0, 0)
+        site = WatchedSite(
+            domain="x.com",
+            check_interval_minutes=60,
+            last_checked_at=slot.timestamp() - 1,
+        )
+        self.assertTrue(site_is_due(site, now=datetime(2026, 8, 12, 10, 0, 30)))
+        site.last_checked_at = datetime(2026, 8, 12, 10, 0, 5).timestamp()
+        self.assertFalse(site_is_due(site, now=datetime(2026, 8, 12, 10, 30, 0)))
+        self.assertTrue(site_is_due(site, now=datetime(2026, 8, 12, 11, 0, 10)))
 
 
 class TestWatchlistHelpers(unittest.TestCase):
@@ -67,6 +113,18 @@ class TestWatchlistHelpers(unittest.TestCase):
             domain_hint_from_user_input("https://www.example.com/posts"),
             "example.com",
         )
+
+    def test_format_site_digest(self) -> None:
+        posts = [
+            CandidatePost(url="https://b.test/1", title="Alpha", summary="First para."),
+            CandidatePost(url="https://b.test/2", title="Beta", summary="Second para."),
+        ]
+        text = format_site_digest("b.test", posts)
+        self.assertIn("<b>b.test</b>", text)
+        self.assertIn("2 new posts", text)
+        self.assertIn("<b>1. Alpha</b>", text)
+        self.assertIn("First para.", text)
+        self.assertIn("<b>2. Beta</b>", text)
 
 
 if __name__ == "__main__":

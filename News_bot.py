@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import html as html_module
 import logging
 import re
 import secrets
@@ -32,6 +31,12 @@ from telegram.ext import (
 )
 
 import config
+from article_filters import (
+    add_eliminate_phrase,
+    load_eliminate_phrases,
+    normalize_site_key,
+    remove_eliminate_phrase,
+)
 from article_format import format_paragraphs_for_telegram
 from article_cache import load_last_article, purge_expired as purge_article_cache, save_last_article
 from article_export import (
@@ -76,13 +81,14 @@ from watchlist import (
     CandidatePost,
     check_site,
     domain_hint_from_user_input,
-    first_paragraph,
+    format_site_digest,
 )
 from watchlist_store import (
     DEFAULT_CHECK_INTERVAL_MINUTES,
     WatchedSite,
     get_site,
     load_watchlist,
+    normalize_check_interval,
     remove_site,
     set_interval,
     site_is_due,
@@ -161,6 +167,9 @@ _BOT_COMMAND_NAMES = frozenset(
         "watch_remove",
         "watch_interval",
         "watch_check",
+        "eliminate_phrase",
+        "list_eliminate_phrases",
+        "remove_eliminate_phrase",
     }
 )
 
@@ -203,6 +212,8 @@ PENDING_SPEAK_PHRASE: dict[int, "PendingSpeakPhrase"] = {}
 PENDING_RULE_ACTION: dict[str, "PendingRuleAction"] = {}
 PENDING_FIND_SESSION: dict[str, "PendingFindSession"] = {}
 PENDING_WATCH_POST: dict[str, "PendingWatchPost"] = {}
+PENDING_ELIMINATE_PHRASE: dict[int, "PendingEliminatePhrase"] = {}
+PENDING_ELIMINATE_DELETE: dict[str, "PendingEliminateDelete"] = {}
 
 # Inline actions after an article is delivered (callback_data must be <= 64 bytes).
 _CALLBACK_SPEAK = "a:speak"
@@ -300,11 +311,30 @@ class PendingFindSession:
 
 @dataclass
 class PendingWatchPost:
-    """Watchlist notify: Read or Speak a new blog post."""
+    """Watchlist digest: Read or Speak one or all new posts from a site."""
 
     user_id: int
-    url: str
-    title: str
+    domain: str
+    posts: list[CandidatePost]
+    action: str | None = None
+    expires_monotonic: float = 0.0
+
+
+@dataclass
+class PendingEliminatePhrase:
+    """Interactive /eliminate_phrase: website first, then phrase."""
+
+    user_id: int
+    domain: str | None = None
+    step: str = "awaiting_website"
+    expires_monotonic: float = 0.0
+
+
+@dataclass
+class PendingEliminateDelete:
+    user_id: int
+    domain: str
+    phrase: str
     expires_monotonic: float
 
 
@@ -616,6 +646,14 @@ def _purge_expired_pending() -> None:
     dead_w = [k for k, v in PENDING_WATCH_POST.items() if now > v.expires_monotonic]
     for k in dead_w:
         del PENDING_WATCH_POST[k]
+    expired_elim = [
+        uid for uid, v in PENDING_ELIMINATE_PHRASE.items() if now > v.expires_monotonic
+    ]
+    for uid in expired_elim:
+        del PENDING_ELIMINATE_PHRASE[uid]
+    dead_ed = [k for k, v in PENDING_ELIMINATE_DELETE.items() if now > v.expires_monotonic]
+    for k in dead_ed:
+        del PENDING_ELIMINATE_DELETE[k]
 
 
 def _pending_rule_action_put(user_id: int, from_text: str, to_text: str) -> str:
@@ -659,13 +697,18 @@ def _pending_find_session_get(token: str) -> PendingFindSession | None:
     return p
 
 
-def _pending_watch_post_put(user_id: int, url: str, title: str) -> str:
+_WATCH_PENDING_TTL = 12 * 3600
+
+
+def _pending_watch_post_put(
+    user_id: int, domain: str, posts: list[CandidatePost]
+) -> str:
     token = secrets.token_hex(6)
     PENDING_WATCH_POST[token] = PendingWatchPost(
         user_id=user_id,
-        url=url,
-        title=title,
-        expires_monotonic=time.monotonic() + config.PENDING_OVERSIZE_TTL,
+        domain=domain,
+        posts=list(posts),
+        expires_monotonic=time.monotonic() + _WATCH_PENDING_TTL,
     )
     return token
 
@@ -676,6 +719,55 @@ def _pending_watch_post_get(token: str) -> PendingWatchPost | None:
         return None
     if time.monotonic() > p.expires_monotonic:
         del PENDING_WATCH_POST[token]
+        return None
+    return p
+
+
+def _pending_eliminate_phrase_put(
+    user_id: int,
+    *,
+    domain: str | None = None,
+    step: str = "awaiting_website",
+) -> None:
+    PENDING_ELIMINATE_PHRASE[user_id] = PendingEliminatePhrase(
+        user_id=user_id,
+        domain=domain,
+        step=step,
+        expires_monotonic=time.monotonic() + config.PENDING_OVERSIZE_TTL,
+    )
+
+
+def _pending_eliminate_phrase_get(user_id: int) -> PendingEliminatePhrase | None:
+    pending = PENDING_ELIMINATE_PHRASE.get(user_id)
+    if pending is None:
+        return None
+    if time.monotonic() > pending.expires_monotonic:
+        del PENDING_ELIMINATE_PHRASE[user_id]
+        return None
+    return pending
+
+
+def _pending_eliminate_phrase_clear(user_id: int) -> None:
+    PENDING_ELIMINATE_PHRASE.pop(user_id, None)
+
+
+def _pending_eliminate_delete_put(user_id: int, domain: str, phrase: str) -> str:
+    token = secrets.token_hex(6)
+    PENDING_ELIMINATE_DELETE[token] = PendingEliminateDelete(
+        user_id=user_id,
+        domain=domain,
+        phrase=phrase,
+        expires_monotonic=time.monotonic() + config.PENDING_OVERSIZE_TTL,
+    )
+    return token
+
+
+def _pending_eliminate_delete_get(token: str) -> PendingEliminateDelete | None:
+    p = PENDING_ELIMINATE_DELETE.get(token)
+    if p is None:
+        return None
+    if time.monotonic() > p.expires_monotonic:
+        del PENDING_ELIMINATE_DELETE[token]
         return None
     return p
 
@@ -720,6 +812,7 @@ def _clear_user_interactive_state(user_id: int) -> None:
     """Drop word-fix / speak-phrase / pronunciation sample sessions."""
     PENDING_WORD_FIX.pop(user_id, None)
     PENDING_SPEAK_PHRASE.pop(user_id, None)
+    PENDING_ELIMINATE_PHRASE.pop(user_id, None)
     batch_ids = {p.batch_id for p in PENDING_PRONUNCIATION.values() if p.user_id == user_id}
     for token in [t for t, p in PENDING_PRONUNCIATION.items() if p.user_id == user_id]:
         _pending_pronunciation_remove(token)
@@ -1089,9 +1182,10 @@ async def cmd_nevermind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user_id = update.effective_user.id
     had_word_fix = user_id in PENDING_WORD_FIX
     had_speak = user_id in PENDING_SPEAK_PHRASE
+    had_elim = user_id in PENDING_ELIMINATE_PHRASE
     had_samples = any(p.user_id == user_id for p in PENDING_PRONUNCIATION.values())
     _clear_user_interactive_state(user_id)
-    if not (had_word_fix or had_speak or had_samples):
+    if not (had_word_fix or had_speak or had_samples or had_elim):
         await update.message.reply_text(
             "Nothing to cancel. Send me a news article URL when you're ready."
         )
@@ -1107,11 +1201,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _allowed_user(update.effective_user.id):
         await update.message.reply_text("You are not authorized to use this bot.")
         return
+    domain_note = (
+        "If the site is not on your list yet, I will ask whether to add its domain.\n\n"
+        if config.ASK_ADD_DOMAIN
+        else "Unknown sites are added to your approved list automatically.\n\n"
+    )
     await update.message.reply_text(
         "Send me a message containing a news article URL (HTTPS, approved domain). "
         "I will fetch and return readable text.\n\n"
-        "If the site is not on your list yet, I will ask whether to add its domain.\n\n"
-        "After each article you can tap Speak to me or Save to disk, "
+        + domain_note
+        + "After each article you can tap Speak to me or Save to disk, "
         "or type those phrases.\n"
         "After audio is ready, tap Fix a word or send /fixaword to tune pronunciation.\n\n"
         "Commands: /list_domains, /add_domain, /remove_domain, /list_bad_domains, "
@@ -1122,7 +1221,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "     /delete_pronunciation <from> — remove a rule from tts_replacements.json\n"
         "     /add_pronunciation <from> <to> — add a rule without audio preview\n"
         "     /nevermind — cancel fix-a-word or other in-progress prompts\n"
-        "Watch: /watch_add <site> [minutes] — poll a blog for new posts\n"
+        "Filter: /eliminate_phrase — I'll ask for the website, then the phrase to strip\n"
+        "        /list_eliminate_phrases [site], /remove_eliminate_phrase <site> <phrase>\n"
+        "Watch: /watch_add <site> [15|30|60|120…] — poll a blog for new posts\n"
+        "       (15/30 fire on those minutes; 60+ at the top of the hour)\n"
         "       /watch_list, /watch_remove, /watch_interval, /watch_check"
     )
 
@@ -1465,6 +1567,22 @@ async def _deliver_user_url_fetch(
                     )
                     return
                 if domain not in current and update.effective_user:
+                    if not config.ASK_ADD_DOMAIN:
+                        current.add(domain)
+                        save_domains(config.DOMAINS_FILE, current)
+                        await _reply_on_chat(
+                            update,
+                            context,
+                            f"Added {domain} to the approved list. Fetching…",
+                        )
+                        await _deliver_user_url_fetch(
+                            update,
+                            context,
+                            url,
+                            offer_domain_prompt=False,
+                            domain_trial=domain,
+                        )
+                        return
                     _, kb = _pending_domain_put(
                         update.effective_user.id,
                         url,
@@ -2492,6 +2610,42 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     user_id = update.effective_user.id
+    pending_elim = _pending_eliminate_phrase_get(user_id)
+    if pending_elim is not None:
+        if text.startswith("/"):
+            await update.message.reply_text(
+                "Still setting up a phrase filter. Reply with plain text, "
+                "or send /nevermind to cancel."
+            )
+            return
+        if pending_elim.step == "awaiting_website":
+            domain = normalize_site_key(text)
+            if not domain or not is_valid_registrable_domain(domain):
+                await update.message.reply_text(
+                    "That doesn't look like a website. Try foxnews.com "
+                    "(or paste a URL from the site).\n\n"
+                    "Send /nevermind to cancel."
+                )
+                return
+            _pending_eliminate_phrase_put(
+                user_id, domain=domain, step="awaiting_phrase"
+            )
+            await update.message.reply_text(
+                f"What phrase should I strip from {domain} articles?\n\n"
+                "Example: CLICK HERE TO DOWNLOAD THE FOX NEWS APP\n\n"
+                "Send /nevermind to cancel."
+            )
+            return
+        if not pending_elim.domain:
+            _pending_eliminate_phrase_clear(user_id)
+            await update.message.reply_text(
+                "Session expired. Send /eliminate_phrase to start again."
+            )
+            return
+        _pending_eliminate_phrase_clear(user_id)
+        await _commit_eliminate_phrase(update, pending_elim.domain, text)
+        return
+
     pending_speak = _pending_speak_phrase_get(user_id)
     if pending_speak is not None:
         if text.startswith("/") and not text.lower().startswith("/speak"):
@@ -2607,19 +2761,168 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     _pending_word_fix_clear(user_id)
     _pending_speak_phrase_clear(user_id)
+    _pending_eliminate_phrase_clear(user_id)
     await _deliver_user_url_fetch(update, context, url, offer_domain_prompt=True)
 
 
+async def _commit_eliminate_phrase(
+    update: Update, domain: str, phrase: str
+) -> None:
+    if not update.message:
+        return
+    try:
+        added = add_eliminate_phrase(domain, phrase)
+    except ValueError as e:
+        await update.message.reply_text(str(e))
+        return
+    path = config.ELIMINATE_PHRASES_FILE.resolve()
+    if added:
+        await update.message.reply_text(
+            f"Will strip this phrase from {domain} articles:\n{phrase}\n\nSaved to {path}"
+        )
+    else:
+        await update.message.reply_text(
+            f"That phrase is already listed for {domain}."
+        )
+
+
+async def cmd_eliminate_phrase(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not _allowed_user(update.effective_user.id):
+        await update.message.reply_text("You are not authorized.")
+        return
+    _pending_eliminate_phrase_put(
+        update.effective_user.id, domain=None, step="awaiting_website"
+    )
+    await update.message.reply_text(
+        "What website should this phrase be removed from?\n\n"
+        "Example: foxnews.com\n\n"
+        "Send /nevermind to cancel."
+    )
+
+
+async def cmd_list_eliminate_phrases(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not _allowed_user(update.effective_user.id):
+        await update.message.reply_text("You are not authorized.")
+        return
+    args = context.args or []
+    sites = load_eliminate_phrases()
+    filter_domain: str | None = None
+    if args:
+        filter_domain = normalize_site_key(args[0])
+        if not filter_domain:
+            await update.message.reply_text("Could not parse that website.")
+            return
+        sites = {filter_domain: sites.get(filter_domain, [])} if filter_domain in sites else {}
+    if not sites:
+        if filter_domain:
+            await update.message.reply_text(f"No eliminated phrases for {filter_domain}.")
+        else:
+            await update.message.reply_text(
+                "No eliminated phrases yet. Add one with /eliminate_phrase."
+            )
+        return
+
+    lines: list[str] = ["Eliminated phrases:"]
+    rows: list[list[InlineKeyboardButton]] = []
+    for domain, phrases in sorted(sites.items()):
+        lines.append(f"\n{domain}")
+        for i, phrase in enumerate(phrases, start=1):
+            preview = phrase if len(phrase) <= 80 else phrase[:77] + "…"
+            lines.append(f"  {i}. {preview}")
+            token = _pending_eliminate_delete_put(
+                update.effective_user.id, domain, phrase
+            )
+            label = f"Delete {domain} #{i}"
+            if len(label) > 64:
+                label = f"Delete #{i}"
+            rows.append([InlineKeyboardButton(label, callback_data=f"ed:{token}")])
+    await update.message.reply_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(rows) if rows else None,
+    )
+
+
+async def cmd_remove_eliminate_phrase(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not _allowed_user(update.effective_user.id):
+        await update.message.reply_text("You are not authorized.")
+        return
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Usage: /remove_eliminate_phrase <website> <phrase>\n"
+            "Or /list_eliminate_phrases and tap Delete."
+        )
+        return
+    domain = normalize_site_key(args[0])
+    if not domain:
+        await update.message.reply_text("Could not parse that website.")
+        return
+    phrase = " ".join(args[1:]).strip()
+    try:
+        removed = remove_eliminate_phrase(domain, phrase)
+    except ValueError as e:
+        await update.message.reply_text(str(e))
+        return
+    if removed:
+        await update.message.reply_text(f"Removed phrase from {domain}:\n{phrase}")
+    else:
+        await update.message.reply_text(
+            f"No matching phrase for {domain}. Use /list_eliminate_phrases."
+        )
+
+
+async def on_eliminate_delete_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    if not query or not query.data or not update.effective_user:
+        return
+    if not _allowed_user(update.effective_user.id):
+        await query.answer("Not authorized.", show_alert=True)
+        return
+    if not query.data.startswith("ed:"):
+        return
+    pending = _pending_eliminate_delete_get(query.data[3:])
+    if pending is None:
+        await query.answer("Expired. Run /list_eliminate_phrases again.", show_alert=True)
+        return
+    if pending.user_id != update.effective_user.id:
+        await query.answer("Not your request.", show_alert=True)
+        return
+    await query.answer()
+    PENDING_ELIMINATE_DELETE.pop(query.data[3:], None)
+    try:
+        removed = remove_eliminate_phrase(pending.domain, pending.phrase)
+    except ValueError as e:
+        await query.edit_message_text(str(e))
+        return
+    if removed:
+        await query.edit_message_text(
+            f"Removed phrase from {pending.domain}:\n{pending.phrase}"
+        )
+    else:
+        await query.edit_message_text("That phrase was already gone.")
+
+
 def _watch_interval_default() -> int:
-    return max(
-        5,
+    return normalize_check_interval(
         int(
             getattr(
                 config,
                 "WATCHLIST_DEFAULT_INTERVAL_MINUTES",
                 DEFAULT_CHECK_INTERVAL_MINUTES,
             )
-        ),
+        )
     )
 
 
@@ -2635,12 +2938,14 @@ async def cmd_watch_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     args = context.args or []
     if not args:
         await update.message.reply_text(
-            "Usage: /watch_add <website> [check_interval_minutes]\n\n"
+            "Usage: /watch_add <website> [15|30|60|120…]\n\n"
             "Example:\n"
             "  /watch_add hackaday.com\n"
-            "  /watch_add marktechpost.com 120\n\n"
-            "I will poll the site's RSS/Atom feed (or WordPress API) and notify you "
-            "when new posts appear. Default interval: "
+            "  /watch_add marktechpost.com 30\n"
+            "  /watch_add example.com 120\n\n"
+            "15 or 30 minutes: checks on those clock marks (:00/:15/:30/:45 or :00/:30).\n"
+            "60, 120, … minutes: checks at the top of the hour.\n"
+            "New posts from a site arrive in one message. Default interval: "
             f"{_watch_interval_default()} minutes."
         )
         return
@@ -2656,9 +2961,11 @@ async def cmd_watch_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     interval = _watch_interval_default()
     if len(args) >= 2:
         try:
-            interval = int(args[1])
+            interval = normalize_check_interval(int(args[1]))
         except ValueError:
-            await update.message.reply_text("Interval must be minutes as an integer.")
+            await update.message.reply_text(
+                "Interval must be 15, 30, or a multiple of 60 minutes."
+            )
             return
 
     existing = get_site(config.WATCHLIST_FILE, domain)
@@ -2678,7 +2985,8 @@ async def cmd_watch_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         save_domains(config.DOMAINS_FILE, approved)
 
     await update.message.reply_text(
-        f"Watching {domain} every {site.check_interval_minutes} minutes.\n"
+        f"Watching {domain} every {site.check_interval_minutes} minutes "
+        f"(clock-aligned).\n"
         f"Also added to approved domains if needed.\n"
         f"Saved to {config.WATCHLIST_FILE.resolve()}\n\n"
         "First check seeds recent posts without notifications. "
@@ -2738,8 +3046,8 @@ async def cmd_watch_interval(update: Update, context: ContextTypes.DEFAULT_TYPE)
     args = context.args or []
     if len(args) < 2:
         await update.message.reply_text(
-            "Usage: /watch_interval <website> <minutes>\n"
-            "Example: /watch_interval hackaday.com 45"
+            "Usage: /watch_interval <website> <15|30|60|120…>\n"
+            "Example: /watch_interval hackaday.com 30"
         )
         return
     domain = domain_hint_from_user_input(args[0])
@@ -2748,9 +3056,11 @@ async def cmd_watch_interval(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     domain = normalize_registrable_hint(domain)
     try:
-        minutes = int(args[1])
+        minutes = normalize_check_interval(int(args[1]))
     except ValueError:
-        await update.message.reply_text("Minutes must be an integer.")
+        await update.message.reply_text(
+            "Minutes must be 15, 30, or a multiple of 60."
+        )
         return
     site = set_interval(config.WATCHLIST_FILE, domain, minutes)
     if site is None:
@@ -2774,14 +3084,16 @@ async def cmd_watch_check(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await _run_watchlist_checks(context.application, force=True)
 
 
-async def _notify_watch_post(
+async def _notify_watch_digest(
     app: Application,
     *,
     user_id: int,
     site_domain: str,
-    post: CandidatePost,
+    posts: list[CandidatePost],
 ) -> None:
-    token = _pending_watch_post_put(user_id, post.url, post.title)
+    if not posts:
+        return
+    token = _pending_watch_post_put(user_id, site_domain, posts)
     kb = InlineKeyboardMarkup(
         [
             [
@@ -2790,12 +3102,7 @@ async def _notify_watch_post(
             ]
         ]
     )
-    title_html = f"<b>{html_module.escape(post.title)}</b>"
-    body = first_paragraph(post.summary) or "(No summary available.)"
-    text = (
-        f"{title_html}\n\n{html_module.escape(body)}\n\n"
-        f"{html_module.escape(site_domain)}\n{html_module.escape(post.url)}"
-    )
+    text = format_site_digest(site_domain, posts)
     try:
         await app.bot.send_message(
             chat_id=user_id,
@@ -2806,6 +3113,20 @@ async def _notify_watch_post(
         )
     except TelegramError as e:
         logger.warning("Watch notify failed for user %s: %s", user_id, e)
+
+
+def _watch_post_picker_keyboard(token: str, posts: list[CandidatePost]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for i, _post in enumerate(posts):
+        row.append(InlineKeyboardButton(str(i + 1), callback_data=f"wp:{token}:{i}"))
+        if len(row) == 5:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("ALL", callback_data=f"wp:{token}:a")])
+    return InlineKeyboardMarkup(rows)
 
 
 async def _run_watchlist_checks(app: Application, *, force: bool = False) -> None:
@@ -2832,10 +3153,13 @@ async def _run_watchlist_checks(app: Application, *, force: bool = False) -> Non
                     )
                 except TelegramError:
                     pass
-        for post in result.new_posts:
+        if result.new_posts:
             for uid in sorted(config.ALLOWED_TELEGRAM_USER_IDS):
-                await _notify_watch_post(
-                    app, user_id=uid, site_domain=result.site.domain, post=post
+                await _notify_watch_digest(
+                    app,
+                    user_id=uid,
+                    site_domain=result.site.domain,
+                    posts=result.new_posts,
                 )
 
 
@@ -2897,6 +3221,72 @@ async def _fetch_article_into_cache(
     return None
 
 
+async def _speak_watch_posts(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    user_id: int,
+    posts: list[CandidatePost],
+) -> None:
+    chat_id = _action_chat_id(update)
+    if chat_id is None:
+        return
+    total = len(posts)
+    for i, post in enumerate(posts, start=1):
+        await context.bot.send_message(
+            chat_id,
+            f"Fetching for audio ({i}/{total}): {post.title}",
+        )
+        err = await _fetch_article_into_cache(
+            update, context, post.url, user_id=user_id
+        )
+        if err:
+            await context.bot.send_message(chat_id, f"{post.title}: {err}")
+            continue
+        await _run_speak(update, context)
+
+
+async def _read_watch_posts(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    posts: list[CandidatePost],
+) -> None:
+    chat_id = _action_chat_id(update)
+    if chat_id is None:
+        return
+    total = len(posts)
+    for i, post in enumerate(posts, start=1):
+        await context.bot.send_message(chat_id, f"Reading ({i}/{total}): {post.title}")
+        await _deliver_user_url_fetch(
+            update, context, post.url, offer_domain_prompt=True
+        )
+
+
+def _schedule_watch_speak(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    user_id: int,
+    posts: list[CandidatePost],
+) -> None:
+    task = asyncio.create_task(
+        _speak_watch_posts(update, context, user_id=user_id, posts=posts),
+        name="speak-watch-posts",
+    )
+    tasks: set[asyncio.Task] = context.application.bot_data.setdefault("speak_tasks", set())
+    tasks.add(task)
+
+    def _done(t: asyncio.Task) -> None:
+        tasks.discard(t)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            logger.error("Watch speak task failed: %s", exc, exc_info=exc)
+
+    task.add_done_callback(_done)
+
+
 async def on_watch_post_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -2907,37 +3297,77 @@ async def on_watch_post_callback(
         await query.answer("Not authorized.", show_alert=True)
         return
     data = query.data
-    if not (data.startswith("wr:") or data.startswith("ws:")):
+    if data.startswith("wr:") or data.startswith("ws:"):
+        pending = _pending_watch_post_get(data[3:])
+        if pending is None:
+            await query.answer(
+                "This digest expired. Wait for the next watch notify.",
+                show_alert=True,
+            )
+            return
+        if pending.user_id != update.effective_user.id:
+            await query.answer("Not your request.", show_alert=True)
+            return
+        pending.action = "read" if data.startswith("wr:") else "speak"
+        pending.expires_monotonic = time.monotonic() + _WATCH_PENDING_TTL
+        await query.answer()
+        chat_id = _action_chat_id(update)
+        if chat_id is None:
+            return
+        verb = "Read" if pending.action == "read" else "Speak"
+        lines = [f"{verb} which post from {pending.domain}?"]
+        for i, post in enumerate(pending.posts, start=1):
+            lines.append(f"{i}. {post.title}")
+        lines.append("ALL — every post in this digest")
+        await context.bot.send_message(
+            chat_id,
+            "\n".join(lines),
+            reply_markup=_watch_post_picker_keyboard(data[3:], pending.posts),
+        )
         return
-    pending = _pending_watch_post_get(data[3:])
-    if pending is None:
-        await query.answer("This post expired. Wait for the next watch notify.", show_alert=True)
+
+    if not data.startswith("wp:"):
+        return
+    parts = data.split(":")
+    if len(parts) != 3:
+        await query.answer()
+        return
+    _, token, choice = parts
+    pending = _pending_watch_post_get(token)
+    if pending is None or not pending.action:
+        await query.answer(
+            "Session expired. Tap Read or Speak on the digest again.",
+            show_alert=True,
+        )
         return
     if pending.user_id != update.effective_user.id:
         await query.answer("Not your request.", show_alert=True)
         return
+
+    if choice == "a":
+        selected = list(pending.posts)
+    else:
+        try:
+            idx = int(choice)
+        except ValueError:
+            await query.answer("Invalid post.", show_alert=True)
+            return
+        if idx < 0 or idx >= len(pending.posts):
+            await query.answer("Invalid post.", show_alert=True)
+            return
+        selected = [pending.posts[idx]]
 
     await query.answer()
     chat_id = _action_chat_id(update)
     if chat_id is None:
         return
 
-    if data.startswith("wr:"):
-        await context.bot.send_message(chat_id, f"Reading: {pending.title}")
-        await _deliver_user_url_fetch(
-            update, context, pending.url, offer_domain_prompt=True
-        )
+    if pending.action == "read":
+        await _read_watch_posts(update, context, selected)
         return
-
-    # Speak
-    await context.bot.send_message(chat_id, f"Fetching for audio: {pending.title}")
-    err = await _fetch_article_into_cache(
-        update, context, pending.url, user_id=pending.user_id
+    _schedule_watch_speak(
+        update, context, user_id=pending.user_id, posts=selected
     )
-    if err:
-        await context.bot.send_message(chat_id, err)
-        return
-    _schedule_speak(update, context)
 
 
 async def on_domain_add_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3144,6 +3574,13 @@ async def _post_init(app: Application) -> None:
                 BotCommand("watch_remove", "Stop watching a blog"),
                 BotCommand("watch_interval", "Set how often to check a blog"),
                 BotCommand("watch_check", "Check watched blogs now"),
+                BotCommand("eliminate_phrase", "Strip a phrase from a site's articles"),
+                BotCommand(
+                    "list_eliminate_phrases", "List phrases stripped from articles"
+                ),
+                BotCommand(
+                    "remove_eliminate_phrase", "Stop stripping a phrase from a site"
+                ),
                 BotCommand("list_domains", "List approved news domains"),
                 BotCommand("add_domain", "Add an approved domain"),
                 BotCommand("remove_domain", "Remove an approved domain"),
@@ -3238,11 +3675,15 @@ def main() -> None:
     app.add_handler(CommandHandler("watch_remove", cmd_watch_remove))
     app.add_handler(CommandHandler("watch_interval", cmd_watch_interval))
     app.add_handler(CommandHandler("watch_check", cmd_watch_check))
+    app.add_handler(CommandHandler("eliminate_phrase", cmd_eliminate_phrase))
+    app.add_handler(CommandHandler("list_eliminate_phrases", cmd_list_eliminate_phrases))
+    app.add_handler(CommandHandler("remove_eliminate_phrase", cmd_remove_eliminate_phrase))
+    app.add_handler(CallbackQueryHandler(on_eliminate_delete_callback, pattern=r"^ed:"))
     app.add_handler(CallbackQueryHandler(on_pronunciation_callback, pattern=r"^ri?:"))
     app.add_handler(CallbackQueryHandler(on_rule_action_callback, pattern=r"^r[pdna]:"))
     app.add_handler(CallbackQueryHandler(on_speak_phrase_callback, pattern=r"^s:"))
     app.add_handler(CallbackQueryHandler(on_word_fix_callback, pattern=r"^wf:"))
-    app.add_handler(CallbackQueryHandler(on_watch_post_callback, pattern=r"^w[rs]:"))
+    app.add_handler(CallbackQueryHandler(on_watch_post_callback, pattern=r"^w[rsp]:"))
     app.add_handler(CallbackQueryHandler(on_domain_add_callback, pattern=r"^[yn]:"))
     app.add_handler(CallbackQueryHandler(on_domain_bad_callback, pattern=r"^[bk]:"))
     app.add_handler(CallbackQueryHandler(on_oversize_callback, pattern=r"^[px]:"))

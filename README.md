@@ -221,12 +221,14 @@ Article **speak** runs in the background — you can fetch the next URL while au
 - `/pronounce <word> <alt1> [alt2…]` — hear pronunciation options and save to `tts_replacements.json`
 - `/add_pronunciation <from> <to>` — add a rule without generating samples
 - `/remove_domain <domain>` or `/remove_domain <PIN> <domain>` (if `ADMIN_PIN` is set)
+- `/eliminate_phrase` — interactive: asks for the website, then the phrase to strip from that site's articles (also `/list_eliminate_phrases`, `/remove_eliminate_phrase`)
 
 ## Security Model
 
 - Only users in `ALLOWED_TELEGRAM_USER_IDS` can use the bot
 - Optional `ADMIN_PIN` for sensitive domain changes
 - HTTP fetch restricted to approved domains
+- `ASK_ADD_DOMAIN=1` (default) prompts to add unknown hosts to `domains.json`; set `0` to add them automatically
 - Redirects are revalidated against approved domains
 - DNS/IP checks block private/loopback/link-local destinations
 
