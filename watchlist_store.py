@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import urlparse, urlunparse
 
 _lock = threading.Lock()
 
@@ -16,6 +18,11 @@ MAX_POSTS_PER_SITE = 20
 DEFAULT_CHECK_INTERVAL_MINUTES = 60
 MIN_CHECK_INTERVAL_MINUTES = 15
 ALLOWED_SUBHOUR_INTERVALS = (15, 30)
+
+_TRACKING_QUERY_RE = re.compile(
+    r"(?:^|&)(?:utm_[^=&]*|fbclid|gclid|mc_cid|mc_eid)=[^&]*",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -34,7 +41,62 @@ class WatchedSite:
     posts: list[WatchedPost] = field(default_factory=list)
 
     def known_urls(self) -> set[str]:
-        return {p.url for p in self.posts}
+        return {normalize_post_url(p.url) for p in self.posts if p.url}
+
+    def known_titles(self) -> set[str]:
+        return {normalize_post_title(p.title) for p in self.posts if p.title.strip()}
+
+
+def normalize_post_title(title: str) -> str:
+    """Case/whitespace-normalized title for duplicate detection."""
+    return " ".join((title or "").casefold().split())
+
+
+def normalize_post_url(url: str) -> str:
+    """
+    Normalize a post URL so minor differences (trailing slash, www, tracking
+    query params) still count as the same post.
+    """
+    text = (url or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = urlparse(text)
+    except Exception:
+        return text.rstrip("/").casefold()
+    scheme = (parsed.scheme or "https").casefold()
+    host = (parsed.hostname or "").casefold().rstrip(".")
+    if host.startswith("www."):
+        host = host[4:]
+    path = parsed.path or "/"
+    if path != "/" and path.endswith("/"):
+        path = path.rstrip("/")
+    query = parsed.query or ""
+    if query:
+        query = _TRACKING_QUERY_RE.sub("", query)
+        query = query.lstrip("&")
+        query = re.sub(r"&&+", "&", query).strip("&")
+    netloc = host
+    if parsed.port and not (
+        (scheme == "http" and parsed.port == 80)
+        or (scheme == "https" and parsed.port == 443)
+    ):
+        netloc = f"{host}:{parsed.port}"
+    return urlunparse((scheme, netloc, path, "", query, ""))
+
+
+def post_identity_keys(url: str, title: str) -> tuple[str, str]:
+    return normalize_post_url(url), normalize_post_title(title)
+
+
+def is_known_post(site: WatchedSite, url: str, title: str) -> bool:
+    """True if this post matches a stored URL or title in the site history."""
+    norm_url, norm_title = post_identity_keys(url, title)
+    if norm_url and norm_url in site.known_urls():
+        return True
+    if norm_title and norm_title in site.known_titles():
+        return True
+    return False
 
 
 def normalize_check_interval(minutes: int) -> int:
@@ -197,18 +259,25 @@ def set_interval(path: Path, domain: str, minutes: int) -> WatchedSite | None:
 
 def merge_new_posts(site: WatchedSite, new_posts: list[WatchedPost]) -> list[WatchedPost]:
     """
-    Prepend truly new posts (by URL). Cap at MAX_POSTS_PER_SITE.
-    Returns the posts that were newly added (newest-first among the batch).
+    Prepend truly new posts (by normalized URL or title). Cap at MAX_POSTS_PER_SITE.
+    Returns the posts that were newly added (caller order preserved among added).
     """
     if not new_posts:
         return []
-    known = site.known_urls()
+    known_urls = site.known_urls()
+    known_titles = site.known_titles()
     added: list[WatchedPost] = []
     now = time.time()
     for post in new_posts:
-        if post.url in known:
+        norm_url, norm_title = post_identity_keys(post.url, post.title)
+        if norm_url and norm_url in known_urls:
             continue
-        known.add(post.url)
+        if norm_title and norm_title in known_titles:
+            continue
+        if norm_url:
+            known_urls.add(norm_url)
+        if norm_title:
+            known_titles.add(norm_title)
         added.append(
             WatchedPost(
                 url=post.url,
@@ -221,6 +290,68 @@ def merge_new_posts(site: WatchedSite, new_posts: list[WatchedPost]) -> list[Wat
     # Keep feed order (caller should pass newest-first); prepend batch as a block.
     site.posts = (added + site.posts)[:MAX_POSTS_PER_SITE]
     return added
+
+
+def refresh_recent_posts(
+    site: WatchedSite,
+    recent: list[WatchedPost],
+) -> None:
+    """
+    Replace the site's stored history with the feed's current top posts (≤20),
+    preserving seen_at when a post matches a prior URL or title.
+    """
+    previous = list(site.posts)
+    by_url = {normalize_post_url(p.url): p for p in previous if p.url}
+    by_title = {
+        normalize_post_title(p.title): p for p in previous if p.title.strip()
+    }
+    now = time.time()
+    refreshed: list[WatchedPost] = []
+    seen_urls: set[str] = set()
+    seen_titles: set[str] = set()
+    for post in recent:
+        title = (post.title or post.url).strip() or post.url
+        norm_url, norm_title = post_identity_keys(post.url, title)
+        if norm_url and norm_url in seen_urls:
+            continue
+        if norm_title and norm_title in seen_titles:
+            continue
+        prior = None
+        if norm_url and norm_url in by_url:
+            prior = by_url[norm_url]
+        elif norm_title and norm_title in by_title:
+            prior = by_title[norm_title]
+        refreshed.append(
+            WatchedPost(
+                url=post.url,
+                title=title,
+                seen_at=prior.seen_at if prior is not None else (post.seen_at or now),
+            )
+        )
+        if norm_url:
+            seen_urls.add(norm_url)
+        if norm_title:
+            seen_titles.add(norm_title)
+        if len(refreshed) >= MAX_POSTS_PER_SITE:
+            break
+
+    # Keep older remembered posts that fell off the current feed window so a
+    # brief disappearance does not cause a duplicate Telegram notify later.
+    for prior in previous:
+        if len(refreshed) >= MAX_POSTS_PER_SITE:
+            break
+        norm_url, norm_title = post_identity_keys(prior.url, prior.title)
+        if norm_url and norm_url in seen_urls:
+            continue
+        if norm_title and norm_title in seen_titles:
+            continue
+        refreshed.append(prior)
+        if norm_url:
+            seen_urls.add(norm_url)
+        if norm_title:
+            seen_titles.add(norm_title)
+
+    site.posts = refreshed[:MAX_POSTS_PER_SITE]
 
 
 def site_is_due(

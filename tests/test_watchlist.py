@@ -18,9 +18,13 @@ from watchlist_store import (
     WatchedPost,
     WatchedSite,
     current_slot_start,
+    is_known_post,
     load_watchlist,
     merge_new_posts,
     normalize_check_interval,
+    normalize_post_title,
+    normalize_post_url,
+    refresh_recent_posts,
     remove_site,
     site_is_due,
     upsert_site,
@@ -55,6 +59,56 @@ class TestWatchlistStore(unittest.TestCase):
         self.assertEqual(len(added), 3)
         self.assertEqual(len(site.posts), 20)
         self.assertEqual(site.posts[0].url, "https://blog.test/new1")
+
+    def test_dedupe_by_title_and_normalized_url(self) -> None:
+        site = WatchedSite(
+            domain="blog.test",
+            posts=[
+                WatchedPost(
+                    url="https://blog.test/post-a/",
+                    title="Hello World",
+                    seen_at=1,
+                )
+            ],
+        )
+        self.assertTrue(is_known_post(site, "https://www.blog.test/post-a", "Other title"))
+        self.assertTrue(is_known_post(site, "https://blog.test/different", "Hello  World"))
+        self.assertFalse(is_known_post(site, "https://blog.test/new", "Brand New"))
+        added = merge_new_posts(
+            site,
+            [
+                WatchedPost(url="https://blog.test/post-a", title="Hello World", seen_at=2),
+                WatchedPost(url="https://blog.test/x", title="hello world", seen_at=3),
+                WatchedPost(url="https://blog.test/new", title="Brand New", seen_at=4),
+            ],
+        )
+        self.assertEqual(len(added), 1)
+        self.assertEqual(added[0].title, "Brand New")
+
+    def test_refresh_keeps_twenty_recent_titles(self) -> None:
+        site = WatchedSite(
+            domain="blog.test",
+            posts=[
+                WatchedPost(url=f"https://blog.test/old-{i}", title=f"Old {i}", seen_at=i)
+                for i in range(20)
+            ],
+        )
+        recent = [
+            WatchedPost(url=f"https://blog.test/new-{i}", title=f"New {i}", seen_at=100 + i)
+            for i in range(15)
+        ]
+        refresh_recent_posts(site, recent)
+        self.assertEqual(len(site.posts), 20)
+        self.assertEqual(site.posts[0].title, "New 0")
+        # Remaining slots filled from previously remembered titles.
+        self.assertTrue(any(p.title.startswith("Old ") for p in site.posts))
+
+    def test_normalize_helpers(self) -> None:
+        self.assertEqual(
+            normalize_post_url("https://WWW.Example.com/path/?utm_source=x"),
+            "https://example.com/path",
+        )
+        self.assertEqual(normalize_post_title("  Hello   World "), "hello world")
 
     def test_normalize_interval(self) -> None:
         self.assertEqual(normalize_check_interval(15), 15)

@@ -4,7 +4,9 @@
   <img src="docs/NewsCatcher_logo.png" alt="News Catcher — Telegram bot for news articles, text-to-speech, and audio briefings" width="420">
 </p>
 
-**News Catcher** is a self-hosted [Telegram](https://telegram.org) bot that turns news URLs into clean article text in your chat. It supports a domain allowlist, anti-bot fetching (including Playwright for Cloudflare sites), **listen-aloud** via [KittenTTS](https://github.com/KittenML/KittenTTS), saving articles for local experiments, and an optional **overnight audio briefing** pipeline (RSS + local LLM → Google Drive).
+**News Catcher** is a self-hosted [Telegram](https://telegram.org) bot that turns news URLs into clean article text in your chat. It supports a domain allowlist, anti-bot fetching (including Playwright for Cloudflare sites), **listen-aloud** via [KittenTTS](https://github.com/KittenML/KittenTTS), saving articles for local experiments, **deep research** (Google News → local [Ollama](https://ollama.com) article + TTS), and an optional **overnight audio briefing** pipeline (RSS + local LLM → Google Drive).
+
+A **desktop GUI** (`gui_app.py`) offers the same fetch, research, speak, and pronunciation tools without Telegram.
 
 Designed for personal use: you control which publishers are allowed, who can use the bot, and where audio is stored.
 
@@ -28,6 +30,7 @@ If you maintain a fork or publish this repo, add [Topics](https://docs.github.co
 - Patchright (stealth Playwright) fallback for Cloudflare-protected domains (default: `economist.com`, `marktechpost.com`)
 - Startup online notification to allowed Telegram users
 - **Speak last article**: after a URL, send `newscatcher, speak to me` for TTS audio (KittenTTS)
+- **Deep research**: Google News topic or Full Coverage → Ollama writes a standalone news article → speak with a custom outro (Telegram `/research` or GUI **Research** button)
 - **Overnight briefing** (optional): `python -m briefing` → Google Drive (`briefing.yaml`, see `.env.example`)
 
 ## Example Target Domains
@@ -45,6 +48,8 @@ You can add/remove domains at runtime with bot commands.
 ## Project Structure
 
 - `News_bot.py` - Telegram handlers, command flow, chunking, and messaging
+- `gui_app.py` / `gui_service.py` - Desktop GUI (fetch, deep research, speak, Test & Fix)
+- `research.py` / `google_news.py` - Deep research: Google News ingest, URL decode, Ollama synthesis
 - `fetch.py` - HTTP fetching, redirects, limits, anti-SSRF checks, Playwright fallback trigger
 - `fetch_playwright.py` - Headless Chromium fetch for challenge-protected pages
 - `extract.py` - Article extraction (`trafilatura` + readability fallback)
@@ -63,8 +68,9 @@ You can add/remove domains at runtime with bot commands.
 
 - Python 3.10+ (3.12 recommended)
 - Linux/macOS/WSL (works on Linux Mint; Playwright may warn and use Ubuntu fallback build)
-- Telegram bot token from BotFather
-- Your Telegram numeric user ID
+- Telegram bot token from BotFather (Telegram mode only)
+- Your Telegram numeric user ID (Telegram mode only)
+- [Ollama](https://ollama.com) for deep research and optional overnight briefing (`OLLAMA_HOST`, `OLLAMA_MODEL`)
 
 Python dependencies are listed in `requirements.txt`.
 
@@ -99,6 +105,14 @@ Minimum required values:
 
 - `TELEGRAM_BOT_TOKEN`
 - `ALLOWED_TELEGRAM_USER_IDS` (comma-separated numeric IDs)
+
+## Run the desktop GUI
+
+```bash
+python gui_app.py
+```
+
+Same fetch, deep research, speak, and Test & Fix pronunciation tools as Telegram, without a bot token.
 
 ## Run the Bot
 
@@ -212,9 +226,48 @@ You get a short audio clip per spelling; tap **Save** on the one you want. Witho
 
 Article **speak** runs in the background — you can fetch the next URL while audio is generating.
 
+### Deep research
+
+Deep research collects recent headlines from **Google News** (topic search or a **Full Coverage** link), downloads articles from your `domains.json` allowlist, and asks **Ollama** to write a **standalone news article** (not a meta-summary). Sources are listed at the bottom of the text reply.
+
+**Telegram**
+
+```text
+/research Apple smart glasses launch
+/research US war with Iran
+```
+
+Or paste a Google News Full Coverage URL (`news.google.com/stories/…`) — the bot runs research instead of fetching that page as a single article.
+
+Progress updates appear while articles are downloaded and Ollama writes. Then use **Speak to me** or `newscatcher, speak to me`. Research audio ends with: *That's the end from News Catcher's Deep research.*
+
+**Desktop GUI**
+
+```bash
+python gui_app.py
+```
+
+Enter a topic or Full Coverage URL, tap **Research**, then **speak**.
+
+**Requirements**
+
+- Ollama running locally (`ollama serve`; set `OLLAMA_HOST` and `OLLAMA_MODEL` in `.env`)
+- `googlenewsdecoder` (in `requirements.txt`) — resolves Google News redirect URLs to publisher links
+- **patchright** for Full Coverage pages: `patchright install chromium`
+- Outlets you care about must be in `domains.json`
+
+**Config** (`.env`)
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `RESEARCH_MAX_ARTICLES` | `10` | Headlines to fetch per run |
+| `RESEARCH_TARGET_WORDS` | `1000` | Target length for the generated article |
+| `RESEARCH_OLLAMA_TIMEOUT` | `300` | Seconds to wait for Ollama |
+
 ### Commands
 
 - `/start` - intro/help
+- `/research <topic>` — deep research from a topic or Google News Full Coverage URL
 - `/list_domains` - show approved domains
 - `/add_domain <domain>` or `/add_domain <PIN> <domain>` (if `ADMIN_PIN` is set)
 - `/fix_403 <domain>` — record a 403-blocked site and retry the last failed URL
@@ -246,7 +299,7 @@ If soft limit is exceeded, the bot prompts:
 
 Some sites (notably Economist) may return `HTTP 403` to plain HTTP clients.
 
-On anti-bot HTTP responses (**402**, **403**, configurable), the bot tries fallbacks in order (for any **allowlisted** domain when `AUTO_403_FALLBACKS=1`, default):
+On anti-bot HTTP responses (**401**, **402**, **403**, configurable), the bot tries fallbacks in order (for any **allowlisted** domain when `AUTO_403_FALLBACKS=1`, default):
 
 1. **WordPress REST API** — domains in `WORDPRESS_API_DOMAINS` (default: `marktechpost.com`).
 2. **TLS impersonation** (`curl_cffi`) — works for Cloudflare (Politico) and Le Monde (402).
@@ -256,7 +309,7 @@ If a new site returns 403, send the URL again; bypass runs automatically. If it 
 
 Config:
 
-- `ANTIBOT_FALLBACK_STATUSES` (default: `402,403`)
+- `ANTIBOT_FALLBACK_STATUSES` (default: `401,402,403`)
 - `AUTO_403_FALLBACKS` (default: `1`) — try curl_cffi + browser for all allowlisted domains
 - `WORDPRESS_API_DOMAINS` (default when omitted: `marktechpost.com`)
 - `PLAYWRIGHT_FALLBACK_DOMAINS` (used when `AUTO_403_FALLBACKS=0`)
@@ -307,8 +360,14 @@ Includes tests for:
 
 ### `HTTP 401` (commonly Reuters)
 
-- Use a browser-like `USER_AGENT` (default in `.env.example`)
-- Do not append a custom bot token/name to the UA string
+Reuters uses **DataDome**; a 401 often means anti-bot, not a bad user-agent alone.
+
+- Ensure `ANTIBOT_FALLBACK_STATUSES` includes `401` (default: `401,402,403`)
+- Use a browser-like `USER_AGENT` from `.env.example` (do not append a bot name)
+- Install bypass tools: `pip install curl_cffi patchright && patchright install chromium`
+- Send the URL again — bypass runs automatically after 401
+
+Reuters may still block some server/datacenter IPs; residential connections work more often.
 
 ### `HTTP 403` (commonly Economist, MarkTechPost)
 

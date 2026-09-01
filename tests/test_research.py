@@ -11,6 +11,7 @@ from research import (
     google_news_search_rss_url,
     is_google_news_coverage_url,
     parse_research_input,
+    split_research_display,
     synthesize_research_article,
 )
 
@@ -72,7 +73,7 @@ class TestSynthesizeResearchArticle(unittest.TestCase):
 
 
 class TestFormatResearchDisplay(unittest.TestCase):
-    def test_includes_sources(self) -> None:
+    def test_sources_after_body_with_divider(self) -> None:
         text = format_research_display(
             topic="Iran",
             headline="Tensions rise",
@@ -86,9 +87,37 @@ class TestFormatResearchDisplay(unittest.TestCase):
                 )
             ],
         )
+        body_pos = text.find("Article body.")
+        sources_pos = text.find("SOURCES (1 articles)")
+        divider_pos = text.find("━━━━━━━━")
+        self.assertGreater(sources_pos, body_pos)
+        self.assertGreater(divider_pos, body_pos)
         self.assertIn("Research topic: Iran", text)
         self.assertIn("reuters.com", text)
-        self.assertIn("Article body.", text)
+
+
+class TestSplitResearchDisplay(unittest.TestCase):
+    def test_splits_at_sources_divider(self) -> None:
+        from research import SOURCES_DIVIDER
+
+        display = format_research_display(
+            topic="Iran",
+            headline="Tensions rise",
+            body="Article body.",
+            sources=[
+                ArticleSnippet(
+                    title="A",
+                    url="https://reuters.com/a",
+                    source="reuters.com",
+                    text="x",
+                )
+            ],
+        )
+        article_part, sources_part = split_research_display(display)
+        self.assertIn("Article body.", article_part)
+        self.assertNotIn(SOURCES_DIVIDER, article_part)
+        self.assertIn("SOURCES (1 articles)", sources_part)
+        self.assertIn("reuters.com", sources_part)
 
 
 if __name__ == "__main__":

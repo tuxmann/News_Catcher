@@ -102,9 +102,11 @@ else:
     _wp_api_raw = _wp_api_raw.strip().strip('"').strip("'")
     _wp_api_domains = [x.strip().lower() for x in _wp_api_raw.split(",") if x.strip()]
 WORDPRESS_API_DOMAINS: frozenset[str] = frozenset(_wp_api_domains)
+# On anti-bot errors, probe wp-json for any allowlisted domain (many news sites use WordPress).
+WORDPRESS_API_TRY_ALL = _bool("WORDPRESS_API_TRY_ALL", True)
 
 # Anti-bot bypass when plain HTTP returns these status codes (402 = Le Monde, 403 = Cloudflare, etc.).
-_ab_status_raw = os.environ.get("ANTIBOT_FALLBACK_STATUSES", "402,403")
+_ab_status_raw = os.environ.get("ANTIBOT_FALLBACK_STATUSES", "401,402,403")
 ANTIBOT_FALLBACK_STATUSES: frozenset[int] = frozenset(
     int(x.strip()) for x in _ab_status_raw.split(",") if x.strip().isdigit()
 )

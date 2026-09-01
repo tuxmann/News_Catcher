@@ -46,6 +46,14 @@ class TestDomainSpokenName(unittest.TestCase):
         self.assertIsNone(build_intro_text(None))
         self.assertIsNone(build_outro_text("  "))
 
+    def test_deep_research_outro(self) -> None:
+        from tts_branding import build_deep_research_outro_text
+
+        self.assertEqual(
+            build_deep_research_outro_text(),
+            "That's the end from News Catcher's Deep research.",
+        )
+
 
 class TestAcrossfadeFilter(unittest.TestCase):
     def test_two_inputs(self) -> None:

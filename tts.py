@@ -221,6 +221,7 @@ def synthesize_to_mp3(
     *,
     title: str | None = None,
     source_domain: str | None = None,
+    outro_text: str | None = None,
     model_name: str | None = None,
     voice: str | None = None,
     speed: float = 1.0,
@@ -235,6 +236,7 @@ def synthesize_to_mp3(
 
     When source_domain is set and TTS_SOURCE_BRANDING_ENABLED, prepends an intro
     ("From {site} dot com.") and appends an outro ("That's the end from …").
+    Pass outro_text to append a custom closing line instead of the domain outro.
     """
     if not skip_enabled_check and not config.TTS_ENABLED:
         raise RuntimeError("TTS is disabled (set TTS_ENABLED=1).")
@@ -248,11 +250,14 @@ def synthesize_to_mp3(
 
     if config.TTS_SOURCE_BRANDING_ENABLED and source_domain:
         intro = build_intro_text(source_domain)
-        outro = build_outro_text(source_domain)
         if intro:
             chunks.insert(0, intro)
-        if outro:
-            chunks.append(outro)
+        if not outro_text:
+            outro = build_outro_text(source_domain)
+            if outro:
+                chunks.append(outro)
+    if outro_text:
+        chunks.append(normalize_for_tts(outro_text))
 
     model_name = (model_name or config.TTS_MODEL).strip()
     if not model_name:

@@ -20,6 +20,15 @@ Ideas to build on top of the News Catcher Telegram bot (URL in → article text 
 | Handle non-URL messages (speak trigger) | Done (`newscatcher, speak to me`) |
 | TTS / audio | Done (`tts.py` + Telegram `send_audio`) |
 | Multi-source briefing / LLM synthesis | Done (`briefing/` → Google Drive) |
+| Deep research (Google News → Ollama article) | Done (`research.py`, Telegram `/research`, GUI) |
+
+---
+
+## Deep research (implemented)
+
+On-demand topic research: Google News RSS or Full Coverage → fetch allowlisted articles → Ollama writes a published-style story → optional TTS with a News Catcher Deep research outro.
+
+See [README.md](../README.md#deep-research) for usage (`/research`, GUI, env vars).
 
 ---
 

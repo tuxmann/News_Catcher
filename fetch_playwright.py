@@ -14,13 +14,22 @@ _playwright = None
 _browser = None
 _lock = asyncio.Lock()
 
+from fetch_challenge import looks_like_challenge_page
+
 _PAGE_READY_JS = """
 () => {
   const t = (document.title || "").toLowerCase();
+  const body = (document.body && document.body.innerText) || "";
+  const b = body.toLowerCase();
   if (!document.title) return false;
   if (t.includes("just a moment")) return false;
   if (t.includes("403") || t.includes("forbidden")) return false;
   if (t.includes("access denied")) return false;
+  if (t.includes("javascript disabled")) return false;
+  if (t.includes("javascript appears to have")) return false;
+  if (b.includes("please enable javascript")) return false;
+  if (document.getElementById("cmsg")) return false;
+  if ((t === "reuters.com" || t === "www.reuters.com") && body.length < 500) return false;
   return true;
 }
 """
@@ -140,6 +149,10 @@ async def playwright_fetch_html(
         if not _final_url_allowed(final_url, allowed_domains, allow_http):
             raise RuntimeError("Page navigated to a host that is not on the approved list.")
         html = await page.content()
+        if looks_like_challenge_page(html, await page.title()):
+            raise RuntimeError(
+                "Browser still on an anti-bot challenge page (e.g. Reuters/DataDome)."
+            )
         raw = html.encode("utf-8")
         return raw, final_url, "text/html; charset=utf-8"
     finally:

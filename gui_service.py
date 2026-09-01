@@ -35,8 +35,9 @@ from fetch import (
     fetch_url,
 )
 from pronunciation_suggest import suggest_pronunciations
-from research import format_research_display, run_deep_research
+from research import format_research_display, is_research_article_url, run_deep_research
 from tts import synthesize_pronunciation_sample, synthesize_to_mp3
+from tts_branding import build_deep_research_outro_text
 from tts_normalize import add_literal_replacement
 
 logger = logging.getLogger(__name__)
@@ -60,11 +61,24 @@ def format_size(num_bytes: int) -> str:
 
 def fetch_error_message(exc: FetchError) -> str:
     message = str(exc)
-    if message == "HTTP 401":
-        return (
-            "HTTP 401 — the server refused the request (common with anti-bot, e.g. Reuters). "
-            "Use the default browser-like USER_AGENT from .env.example."
+    if message == "HTTP 401" or (exc.blocked_domain and message.startswith("HTTP 401")):
+        domain = exc.blocked_domain or "this site"
+        tried = exc.tried_strategies
+        lines = [f"HTTP 401 — {domain} blocked the request (often Reuters/DataDome)."]
+        if tried:
+            lines.append("Tried: " + ", ".join(tried) + ".")
+        else:
+            lines.append(
+                "Set ANTIBOT_FALLBACK_STATUSES=401,402,403 in .env and restart."
+            )
+        lines.extend(
+            [
+                "",
+                "Use the default browser-like USER_AGENT from .env.example.",
+                "pip install curl_cffi patchright && patchright install chromium",
+            ]
         )
+        return "\n".join(lines)
     if exc.blocked_domain or message.startswith("HTTP 402") or message.startswith("HTTP 403"):
         domain = exc.blocked_domain or "this site"
         tried = exc.tried_strategies
@@ -343,6 +357,7 @@ def fetch_article(
 def deep_research(
     query: str,
     *,
+    user_id: int = GUI_USER_ID,
     on_progress: Callable[[str], None] | None = None,
 ) -> DeepResearchOutcome:
     """Search Google News on a topic, synthesize an article with Ollama."""
@@ -362,7 +377,7 @@ def deep_research(
     )
     save_last_article(
         config.ARTICLE_CACHE_DIR,
-        GUI_USER_ID,
+        user_id,
         f"research:{result.topic}",
         result.title,
         result.text,
@@ -419,11 +434,18 @@ def speak_last_article() -> Path:
 
     config.AUDIO_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     out_path = config.AUDIO_OUTPUT_DIR / f"gui_{GUI_USER_ID}_{int(time.time())}.mp3"
+    kwargs: dict = {}
+    if is_research_article_url(cached.url):
+        kwargs["outro_text"] = build_deep_research_outro_text()
+        source_domain = None
+    else:
+        source_domain = registrable_domain_from_url(cached.url)
     synthesize_to_mp3(
         cached.text,
         out_path,
         title=cached.title,
-        source_domain=registrable_domain_from_url(cached.url),
+        source_domain=source_domain,
+        **kwargs,
     )
     return out_path
 

@@ -48,10 +48,23 @@ def _should_try_strategy(hostname: str | None, *, explicit_domains: set[str]) ->
     return host_allowed(hostname, explicit_domains)
 
 
-def _wordpress_eligible(hostname: str | None) -> bool:
-    if not hostname or not config.WORDPRESS_API_DOMAINS:
+def _wordpress_eligible(hostname: str | None, allowed_domains: set[str]) -> bool:
+    if not hostname:
         return False
-    return host_allowed(hostname, set(config.WORDPRESS_API_DOMAINS))
+    if config.WORDPRESS_API_DOMAINS and host_allowed(
+        hostname, set(config.WORDPRESS_API_DOMAINS)
+    ):
+        return True
+    if config.WORDPRESS_API_TRY_ALL and host_allowed(hostname, allowed_domains):
+        return True
+    return False
+
+
+def _wordpress_api_domains(allowed_domains: set[str]) -> set[str]:
+    """Hosts eligible for a wp-json lookup on this request."""
+    if config.WORDPRESS_API_TRY_ALL:
+        return allowed_domains
+    return set(config.WORDPRESS_API_DOMAINS)
 
 
 def _curl_cffi_eligible(hostname: str | None) -> bool:
@@ -102,13 +115,13 @@ async def try_antibot_fallbacks(
     if domain and (_auto_fallbacks_enabled() or domain in _recorded_domains()):
         record_fallback_domain(domain)
 
-    if _wordpress_eligible(hostname):
+    if _wordpress_eligible(hostname, allowed_domains):
         tried.append("WordPress API")
         result = await wordpress_fetch_html(
             client,
             url,
             allowed_domains,
-            api_domains=set(config.WORDPRESS_API_DOMAINS),
+            api_domains=_wordpress_api_domains(allowed_domains),
         )
         if result is not None:
             raw, final_url = result

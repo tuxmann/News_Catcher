@@ -10,22 +10,7 @@ from domains_store import host_allowed
 
 logger = logging.getLogger(__name__)
 
-_CHALLENGE_MARKERS = (
-    "just a moment",
-    "checking your browser",
-    "enable javascript and cookies",
-    "access denied",
-    "403 - forbidden",
-    "accès restreint",
-    "acces restreint",
-    "client challenge",
-    "couldn't load",
-)
-
-
-def _looks_like_challenge_page(html: str, title: str | None) -> bool:
-    blob = (title or "").lower() + " " + html[:8000].lower()
-    return any(m in blob for m in _CHALLENGE_MARKERS)
+from fetch_challenge import looks_like_challenge_page
 
 
 def _final_url_allowed(final_url: str, allowed_domains: set[str], allow_http: bool) -> bool:
@@ -86,7 +71,7 @@ async def curl_cffi_fetch_html(
             if end > start:
                 title = text[start:end]
 
-        if _looks_like_challenge_page(text, title):
+        if looks_like_challenge_page(text, title):
             logger.warning("curl_cffi still got challenge page for %s", url)
             return None
 

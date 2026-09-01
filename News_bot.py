@@ -65,13 +65,16 @@ from fetch import (
     FetchOversizeUnknown,
     fetch_url,
 )
+from gui_service import deep_research
 from pronunciation_suggest import suggest_pronunciations
+from research import is_google_news_coverage_url, is_research_article_url, split_research_display
 from tts import (
     is_speak_phrase,
     split_mp3_for_telegram,
     synthesize_pronunciation_sample,
     synthesize_to_mp3,
 )
+from tts_branding import build_deep_research_outro_text
 from tts_normalize import (
     add_literal_replacement,
     find_literal_replacements,
@@ -104,6 +107,32 @@ def _fetch_error_reply(exc: FetchError) -> str:
             "Use the default browser-like USER_AGENT from .env.example (remove a short bot-only UA) "
             "and restart the bot."
         )
+    if s == "HTTP 401" or (exc.blocked_domain and s.startswith("HTTP 401")):
+        domain = exc.blocked_domain or "this site"
+        tried = exc.tried_strategies
+        lines = [
+            f"HTTP 401 — {domain} blocked the request (often Reuters/DataDome).",
+        ]
+        if tried:
+            lines.append("Tried: " + ", ".join(tried) + ".")
+        else:
+            lines.append(
+                "Bypass not run yet — set ANTIBOT_FALLBACK_STATUSES=401,402,403 in .env "
+                "and restart the bot."
+            )
+        lines.extend(
+            [
+                "",
+                "Checks:",
+                "• USER_AGENT in .env must be a full Chrome string (see .env.example)",
+                "• pip install curl_cffi patchright && patchright install chromium",
+                "• Send the URL again (bypass runs automatically when 401 is enabled)",
+                "",
+                "Reuters often blocks datacenter IPs entirely; try again from home "
+                "or use /fix_403 reuters.com after a failure.",
+            ]
+        )
+        return "\n".join(lines)
     if exc.blocked_domain or s.startswith("HTTP 402") or s.startswith("HTTP 403"):
         domain = exc.blocked_domain or "this site"
         tried = exc.tried_strategies
@@ -161,6 +190,7 @@ _BOT_COMMAND_NAMES = frozenset(
         "delete_pronunciation",
         "fixaword",
         "speak",
+        "research",
         "nevermind",
         "watch_add",
         "watch_list",
@@ -1146,6 +1176,159 @@ async def cmd_fixaword(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not _allowed_user(update.effective_user.id):
+        await update.message.reply_text("You are not authorized to use this bot.")
+        return
+    args = context.args or []
+    query = " ".join(args).strip()
+    if not query:
+        await update.message.reply_text(
+            "Usage: /research <topic or Google News Full Coverage URL>\n\n"
+            "Examples:\n"
+            "  /research Apple smart glasses launch\n"
+            "  /research US war with Iran\n\n"
+            "You can also paste a news.google.com/stories/… Full Coverage link."
+        )
+        return
+    _schedule_research(update, context, query)
+
+
+def _schedule_research(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, query: str
+) -> None:
+    task = asyncio.create_task(
+        _run_research(update, context, query),
+        name="deep-research",
+    )
+    tasks: set[asyncio.Task] = context.application.bot_data.setdefault("research_tasks", set())
+    tasks.add(task)
+
+    def _done(t: asyncio.Task) -> None:
+        tasks.discard(t)
+        if not t.cancelled():
+            exc = t.exception()
+            if exc is not None:
+                logger.error("Background research task failed: %s", exc, exc_info=exc)
+
+    task.add_done_callback(_done)
+
+
+async def _deliver_research_outcome(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    display_text: str,
+    warning: str | None,
+) -> None:
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if chat_id is None:
+        return
+
+    article_part, sources_part = split_research_display(display_text)
+    header_lines: list[str] = []
+    body_lines: list[str] = []
+    for line in article_part.splitlines():
+        if line.startswith(("Research topic:", "Headline:")):
+            header_lines.append(line)
+        elif line.strip() or body_lines:
+            body_lines.append(line)
+    header = "\n".join(header_lines).strip()
+    body = "\n".join(body_lines).strip()
+
+    if header:
+        await context.bot.send_message(chat_id, header)
+    if body:
+        for msg in _format_article_chunks(
+            format_paragraphs_for_telegram(body),
+            config.TELEGRAM_CHUNK_CHARS,
+        ):
+            try:
+                await context.bot.send_message(chat_id, msg, parse_mode="HTML")
+            except TelegramError:
+                await context.bot.send_message(chat_id, msg)
+    if sources_part:
+        for msg in _format_article_chunks(sources_part, config.TELEGRAM_CHUNK_CHARS):
+            try:
+                await context.bot.send_message(chat_id, msg, parse_mode="HTML")
+            except TelegramError:
+                await context.bot.send_message(chat_id, msg)
+
+    if warning:
+        await context.bot.send_message(chat_id, warning)
+
+    await context.bot.send_message(
+        chat_id,
+        "Research article ready. Tap Speak to me for audio (Deep research outro).",
+        reply_markup=_article_actions_keyboard(),
+    )
+
+
+async def _run_research(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, query: str
+) -> None:
+    if not update.effective_user:
+        return
+    chat_id = _action_chat_id(update)
+    if chat_id is None:
+        return
+
+    user_id = update.effective_user.id
+    _pending_word_fix_clear(user_id)
+    _pending_speak_phrase_clear(user_id)
+    _pending_eliminate_phrase_clear(user_id)
+
+    status_message: Message | None = None
+    try:
+        status_message = await context.bot.send_message(chat_id, "Starting deep research…")
+    except TelegramError:
+        status_message = None
+    loop = asyncio.get_running_loop()
+
+    def on_progress(msg: str) -> None:
+        if status_message is None:
+            return
+
+        async def edit_status() -> None:
+            try:
+                await status_message.edit_text(msg)
+            except TelegramError:
+                pass
+
+        asyncio.run_coroutine_threadsafe(edit_status(), loop)
+
+    try:
+        outcome = await asyncio.to_thread(
+            deep_research,
+            query,
+            user_id=user_id,
+            on_progress=on_progress,
+        )
+    except Exception as exc:
+        logger.exception("deep research failed")
+        await context.bot.send_message(chat_id, f"Research failed: {exc}")
+        return
+
+    if outcome.kind != "ok" or not outcome.article:
+        await context.bot.send_message(chat_id, outcome.error or "Research failed.")
+        return
+
+    if status_message is not None:
+        try:
+            await status_message.delete()
+        except TelegramError:
+            pass
+
+    await _deliver_research_outcome(
+        update,
+        context,
+        display_text=outcome.article.display_text,
+        warning=outcome.warning,
+    )
+
+
 async def cmd_speak(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Speak a single test phrase with current pronunciation rules."""
     if not update.effective_user or not update.message:
@@ -1212,6 +1395,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         + domain_note
         + "After each article you can tap Speak to me or Save to disk, "
         "or type those phrases.\n"
+        "Deep research: /research <topic> — Google News → Ollama article\n"
+        "  or send a Google News Full Coverage link\n"
         "After audio is ready, tap Fix a word or send /fixaword to tune pronunciation.\n\n"
         "Commands: /list_domains, /add_domain, /remove_domain, /list_bad_domains, "
         "/override_bad_domain, /fix_403\n"
@@ -1806,6 +1991,10 @@ async def _run_speak(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await context.bot.send_chat_action(chat_id=chat_id, action="upload_audio")
 
     source_domain = registrable_domain_from_url(cached.url)
+    tts_kwargs: dict = {}
+    if is_research_article_url(cached.url):
+        tts_kwargs["outro_text"] = build_deep_research_outro_text()
+        source_domain = None
     config.AUDIO_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     out_name = telegram_audio_filename(source_domain, cached.title)
     out_path = config.AUDIO_OUTPUT_DIR / f"{user_id}_{int(time.time())}_{out_name}"
@@ -1817,6 +2006,7 @@ async def _run_speak(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             out_path,
             title=cached.title,
             source_domain=source_domain,
+            **tts_kwargs,
         )
     except Exception as e:
         logger.exception("TTS failed")
@@ -2762,6 +2952,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     _pending_word_fix_clear(user_id)
     _pending_speak_phrase_clear(user_id)
     _pending_eliminate_phrase_clear(user_id)
+    if is_google_news_coverage_url(url):
+        _schedule_research(update, context, url)
+        return
     await _deliver_user_url_fetch(update, context, url, offer_domain_prompt=True)
 
 
@@ -3011,7 +3204,7 @@ async def cmd_watch_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         feed = site.feed_url or "(auto-discover)"
         lines.append(
             f"• {site.domain} — every {site.check_interval_minutes} min, "
-            f"{len(site.posts)} posts remembered\n  feed: {feed}"
+            f"{len(site.posts)} recent titles remembered\n  feed: {feed}"
         )
     await update.message.reply_text("\n".join(lines))
 
@@ -3563,6 +3756,7 @@ async def _post_init(app: Application) -> None:
             [
                 BotCommand("start", "Help and how to use the bot"),
                 BotCommand("speak", "Test a phrase with current pronunciations"),
+                BotCommand("research", "Deep research: topic or Full Coverage URL"),
                 BotCommand("fixaword", "Fix a mispronounced word in the last audio"),
                 BotCommand("pronounce", "Preview pronunciation samples for a word"),
                 BotCommand("find_pronunciation", "Find saved rules; pronounce or delete"),
@@ -3628,6 +3822,12 @@ async def _post_shutdown(app: Application) -> None:
     if speak_tasks:
         await asyncio.gather(*speak_tasks, return_exceptions=True)
 
+    research_tasks: set[asyncio.Task] = app.bot_data.get("research_tasks", set())
+    for task in list(research_tasks):
+        task.cancel()
+    if research_tasks:
+        await asyncio.gather(*research_tasks, return_exceptions=True)
+
     watch_task: asyncio.Task | None = app.bot_data.get("watchlist_task")
     if watch_task is not None:
         watch_task.cancel()
@@ -3669,6 +3869,7 @@ def main() -> None:
     app.add_handler(CommandHandler("delete_pronunciation", cmd_delete_pronunciation))
     app.add_handler(CommandHandler("fixaword", cmd_fixaword))
     app.add_handler(CommandHandler("speak", cmd_speak))
+    app.add_handler(CommandHandler("research", cmd_research))
     app.add_handler(CommandHandler("nevermind", cmd_nevermind))
     app.add_handler(CommandHandler("watch_add", cmd_watch_add))
     app.add_handler(CommandHandler("watch_list", cmd_watch_list))

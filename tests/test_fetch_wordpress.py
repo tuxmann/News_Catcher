@@ -5,7 +5,12 @@ from __future__ import annotations
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from fetch_wordpress import slug_from_article_url, wordpress_fetch_html
+from fetch_wordpress import (
+    post_id_from_article_url,
+    slug_from_article_url,
+    slug_variants_from_article_url,
+    wordpress_fetch_html,
+)
 
 
 class TestSlugFromArticleUrl(unittest.TestCase):
@@ -21,6 +26,16 @@ class TestSlugFromArticleUrl(unittest.TestCase):
 
     def test_empty_path(self) -> None:
         self.assertIsNone(slug_from_article_url("https://example.com/"))
+
+    def test_thehill_post_id(self) -> None:
+        url = (
+            "https://thehill.com/media/6059334-carlson-says-trump-should-be-removed/"
+        )
+        self.assertEqual(post_id_from_article_url(url), "6059334")
+        self.assertEqual(
+            slug_variants_from_article_url(url),
+            ["carlson-says-trump-should-be-removed", "6059334-carlson-says-trump-should-be-removed"],
+        )
 
 
 class TestWordpressFetchHtml(unittest.IsolatedAsyncioTestCase):
@@ -47,6 +62,30 @@ class TestWordpressFetchHtml(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final_url, post["link"])
         self.assertIn(b"Body text here", raw)
         self.assertIn(b"Example Title", raw)
+
+    async def test_fetches_by_post_id(self) -> None:
+        post = {
+            "link": "https://thehill.com/media/6059334-carlson-says-trump-should-be-removed/",
+            "title": {"rendered": "Headline"},
+            "content": {"rendered": "<p>Full article body.</p>"},
+        }
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = post
+        client = AsyncMock()
+        client.get = AsyncMock(return_value=mock_resp)
+
+        result = await wordpress_fetch_html(
+            client,
+            "https://thehill.com/media/6059334-carlson-says-trump-should-be-removed/",
+            {"thehill.com"},
+            api_domains={"thehill.com"},
+        )
+        self.assertIsNotNone(result)
+        raw, final_url = result
+        self.assertIn(b"Full article body", raw)
+        client.get.assert_called_once()
+        self.assertIn("/6059334", client.get.call_args[0][0])
 
     async def test_skips_non_api_domain(self) -> None:
         client = AsyncMock()

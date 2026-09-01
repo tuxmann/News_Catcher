@@ -11,6 +11,7 @@ from fetch_403 import (
     _curl_cffi_eligible,
     registrable_domain,
     try_403_fallbacks,
+    try_antibot_fallbacks,
 )
 from fetch import FetchError
 
@@ -87,6 +88,34 @@ class TestTry403Fallbacks(unittest.IsolatedAsyncioTestCase):
                                 user_agent="test",
                             )
         self.assertEqual(result.content, html)
+
+    async def test_401_triggers_curl_cffi_attempt(self) -> None:
+        with patch.object(config, "ANTIBOT_FALLBACK_STATUSES", frozenset({401})):
+            with patch.object(config, "AUTO_403_FALLBACKS", True):
+                with patch.object(config, "CURL_CFFI_ON_403", True):
+                    with patch.object(config, "BROWSER_ON_403", False):
+                        with patch.object(config, "WORDPRESS_API_TRY_ALL", False):
+                            with patch.object(config, "WORDPRESS_API_DOMAINS", frozenset()):
+                                with patch(
+                                    "fetch_curl_cffi.curl_cffi_fetch_html",
+                                    new_callable=AsyncMock,
+                                    return_value=None,
+                                ) as mock_curl:
+                                    client = AsyncMock()
+                                    with self.assertRaises(FetchError) as ctx:
+                                        await try_antibot_fallbacks(
+                                            client,
+                                            "https://www.reuters.com/world/a",
+                                            1_000_000,
+                                            {"reuters.com"},
+                                            allow_http=False,
+                                            user_agent="test",
+                                            http_status=401,
+                                        )
+                                    mock_curl.assert_called_once()
+                                    self.assertEqual(
+                                        ctx.exception.blocked_domain, "reuters.com"
+                                    )
 
     async def test_raises_when_all_fail(self) -> None:
         with patch.object(config, "AUTO_403_FALLBACKS", True):

@@ -18,7 +18,8 @@ from watchlist_store import (
     MAX_POSTS_PER_SITE,
     WatchedPost,
     WatchedSite,
-    merge_new_posts,
+    is_known_post,
+    refresh_recent_posts,
 )
 
 logger = logging.getLogger(__name__)
@@ -235,7 +236,10 @@ class WatchCheckResult:
 
 
 async def check_site(client: httpx.AsyncClient, site: WatchedSite) -> WatchCheckResult:
-    """Poll one site, update seen posts, return newly discovered posts (oldest first for notify)."""
+    """
+    Poll one site, keep ≤20 most recent titles/URLs, return only posts that
+    were not already in that history (matched by URL or title).
+    """
     updated = WatchedSite(
         domain=site.domain,
         check_interval_minutes=site.check_interval_minutes,
@@ -261,32 +265,27 @@ async def check_site(client: httpx.AsyncClient, site: WatchedSite) -> WatchCheck
             error="No RSS/Atom feed or WordPress API posts found",
         )
 
-    # First successful check: seed history without notifying.
+    now = time.time()
+    recent = [
+        WatchedPost(url=c.url, title=c.title, seen_at=now) for c in candidates
+    ][:MAX_POSTS_PER_SITE]
+
+    # First successful check: seed the 20 most recent titles without notifying.
     if not updated.posts:
-        now = time.time()
-        updated.posts = [
-            WatchedPost(url=c.url, title=c.title, seen_at=now) for c in candidates
-        ][:MAX_POSTS_PER_SITE]
+        refresh_recent_posts(updated, recent)
         return WatchCheckResult(site=updated, new_posts=[])
 
-    known = updated.known_urls()
-    brand_new = [c for c in candidates if c.url not in known]
+    # Compare against the previously stored titles/URLs before refreshing.
+    brand_new = [
+        c for c in candidates if not is_known_post(updated, c.url, c.title)
+    ]
+    refresh_recent_posts(updated, recent)
+
     if not brand_new:
-        # Refresh titles for known URLs still in the top window (optional no-op).
         return WatchCheckResult(site=updated, new_posts=[])
 
-    # merge_new_posts expects WatchedPost; keep candidate order (feed newest-first).
-    added = merge_new_posts(
-        updated,
-        [
-            WatchedPost(url=c.url, title=c.title, seen_at=time.time())
-            for c in brand_new
-        ],
-    )
-    added_urls = {p.url for p in added}
     # Notify oldest-first so the conversation reads chronologically.
-    notify = [c for c in reversed(brand_new) if c.url in added_urls]
-    return WatchCheckResult(site=updated, new_posts=notify)
+    return WatchCheckResult(site=updated, new_posts=list(reversed(brand_new)))
 
 
 def domain_hint_from_user_input(raw: str) -> str | None:

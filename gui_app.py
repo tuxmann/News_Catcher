@@ -13,6 +13,7 @@ from tkinter import messagebox, ttk
 import config
 import gui_service as svc
 from gui_audio import GuiAudioPlayer, format_time
+from research import SOURCES_DIVIDER
 
 logger = logging.getLogger(__name__)
 
@@ -277,6 +278,19 @@ class NewsCatcherGui:
                     fg=fg,
                     insertbackground=fg,
                 )
+                widget.tag_configure(
+                    "research_sources",
+                    foreground="#9BB8D9" if self.dark_mode else "#1A4A7A",
+                    background=field_bg,
+                    spacing1=6,
+                    spacing3=4,
+                )
+                widget.tag_configure(
+                    "research_sources_header",
+                    foreground=fg,
+                    background=field_bg,
+                    font=("Segoe UI", 10, "bold"),
+                )
             elif isinstance(widget, tk.Scale):
                 widget.configure(
                     bg=bg,
@@ -367,7 +381,26 @@ class NewsCatcherGui:
     def _set_article(self, text: str) -> None:
         self.article_text.configure(state=tk.NORMAL)
         self.article_text.delete("1.0", tk.END)
+        self.article_text.tag_remove("research_sources", "1.0", tk.END)
+        self.article_text.tag_remove("research_sources_header", "1.0", tk.END)
         self.article_text.insert("1.0", text)
+
+    def _set_research_display(self, text: str) -> None:
+        self._set_article(text)
+        divider_pos = text.find(SOURCES_DIVIDER)
+        if divider_pos < 0:
+            return
+        start = f"1.0+{divider_pos}c"
+        self.article_text.tag_add("research_sources", start, tk.END)
+        header_pos = text.find("SOURCES (", divider_pos)
+        if header_pos >= 0:
+            header_start = f"1.0+{header_pos}c"
+            line_end = text.find("\n", header_pos)
+            if line_end < 0:
+                line_end = len(text)
+            header_end = f"1.0+{line_end}c"
+            self.article_text.tag_add("research_sources_header", header_start, header_end)
+        self.article_text.see("1.0")
 
     def _run_bg(self, work, on_success, on_error, *, set_busy: bool = True) -> None:
         def runner() -> None:
@@ -539,7 +572,7 @@ class NewsCatcherGui:
 
         def on_success(outcome: svc.DeepResearchOutcome) -> None:
             if outcome.kind == "ok" and outcome.article:
-                self._set_article(outcome.article.display_text)
+                self._set_research_display(outcome.article.display_text)
                 if outcome.warning:
                     messagebox.showwarning("News Catcher", outcome.warning)
                 self._finish_task("Research article ready. Tap speak to generate audio.")

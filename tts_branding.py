@@ -41,3 +41,7 @@ def build_outro_text(source_domain: str | None) -> str | None:
         return None
     name = domain_to_spoken_name(source_domain)
     return normalize_for_tts(f"That's the end from {name}.")
+
+
+def build_deep_research_outro_text() -> str:
+    return normalize_for_tts("That's the end from News Catcher's Deep research.")

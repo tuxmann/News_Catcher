@@ -29,6 +29,9 @@ _GOOGLE_NEWS_COVERAGE_RE = re.compile(
 
 ProgressCallback = Callable[[str], None]
 
+# Marker used by the GUI to style the sources block at the bottom of research output.
+SOURCES_DIVIDER = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
 
 @dataclass
 class ResearchResult:
@@ -41,6 +44,10 @@ class ResearchResult:
 
 def is_google_news_coverage_url(url: str) -> bool:
     return bool(_GOOGLE_NEWS_COVERAGE_RE.search(url.strip()))
+
+
+def is_research_article_url(url: str) -> bool:
+    return url.strip().startswith("research:")
 
 
 def parse_research_input(text: str) -> tuple[Literal["coverage", "topic"], str]:
@@ -335,21 +342,27 @@ def synthesize_research_article(
         )
     sources_block = "\n".join(parts)
 
-    prompt = f"""You are a news editor synthesizing recent reporting into one original news article.
+    prompt = f"""You are a staff reporter writing a finished news article for publication.
 
 Topic: {topic}
 
 Target length: about {words} words.
 
-Instructions:
-- Write in clear third-person journalistic prose (for reading, not radio).
-- Open with a compelling headline on its own first line, formatted exactly as: HEADLINE: Your headline here
-- Follow with the article body (3–6 paragraphs, no bullet lists).
-- Weave facts and contrasting viewpoints from the sources; attribute outlets when views differ.
-- Do not invent facts, quotes, or events beyond the sources below.
-- No markdown, stage directions, or meta commentary.
+Write one standalone news story a reader would find on a news site. Report the events and facts directly in third person. The reader should not be able to tell this was assembled from multiple sources.
 
-Sources:
+Required format:
+- Line 1 must be exactly: HEADLINE: <compelling news headline>
+- Then the article body only (3–6 paragraphs, no bullet lists).
+
+Style rules:
+- Lead with the most important news. Do not open with framing about coverage, summaries, or "this article."
+- Never write meta phrases such as: "Here's a summary", "This article examines", "Below is an overview", "Multiple outlets report", "According to various sources", "In recent coverage", or "This piece looks at."
+- Attribute specific claims to outlets only when needed for a direct quote or a clear disagreement (e.g. "The Washington Post reported … while Reuters said …"). Do not narrate that you are synthesizing sources.
+- Use plain journalistic prose suitable for reading on screen.
+- Do not invent facts, quotes, or events beyond the source material below.
+- No markdown, labels, stage directions, or commentary about your writing process.
+
+Source material (for your research only — do not refer to it in the article):
 {sources_block}
 """
 
@@ -383,13 +396,29 @@ def format_research_display(
     body: str,
     sources: list[ArticleSnippet],
 ) -> str:
-    lines = [f"Research topic: {topic}", f"Headline: {headline}", ""]
-    lines.append(f"Sources ({len(sources)} articles):")
+    lines = [
+        f"Research topic: {topic}",
+        f"Headline: {headline}",
+        "",
+        body.strip(),
+        "",
+        SOURCES_DIVIDER,
+        f"SOURCES ({len(sources)} articles)",
+        SOURCES_DIVIDER,
+        "",
+    ]
     for snippet in sources:
         lines.append(f"• {snippet.title} ({snippet.source})")
         lines.append(f"  {snippet.url}")
-    lines.extend(["", body])
     return "\n".join(lines)
+
+
+def split_research_display(display_text: str) -> tuple[str, str]:
+    """Split formatted research output into article header+body and sources block."""
+    pos = display_text.find(SOURCES_DIVIDER)
+    if pos < 0:
+        return display_text.strip(), ""
+    return display_text[:pos].rstrip(), display_text[pos:].strip()
 
 
 async def run_deep_research_async(
