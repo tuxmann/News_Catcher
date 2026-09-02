@@ -354,6 +354,45 @@ def refresh_recent_posts(
     site.posts = refreshed[:MAX_POSTS_PER_SITE]
 
 
+def is_quiet_hours(
+    start_hour: int,
+    end_hour: int,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """
+    True when local time is inside the quiet window [start_hour, end_hour).
+
+    When start_hour == end_hour the window is disabled. Overnight windows
+    (e.g. 22→6) use start_hour > end_hour.
+    """
+    start = int(start_hour) % 24
+    end = int(end_hour) % 24
+    if start == end:
+        return False
+    now = datetime.now() if now is None else now
+    hour = now.hour
+    if start < end:
+        return start <= hour < end
+    return hour >= start or hour < end
+
+
+def format_quiet_hours(start_hour: int, end_hour: int) -> str:
+    """Human-readable local-time range, e.g. '12am–4am'."""
+
+    def _label(hour: int) -> str:
+        h = int(hour) % 24
+        if h == 0:
+            return "12am"
+        if h < 12:
+            return f"{h}am"
+        if h == 12:
+            return "12pm"
+        return f"{h - 12}pm"
+
+    return f"{_label(start_hour)}–{_label(end_hour)}"
+
+
 def site_is_due(
     site: WatchedSite,
     *,

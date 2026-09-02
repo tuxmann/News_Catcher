@@ -20,7 +20,7 @@ from telegram import (
     MessageEntity,
     Update,
 )
-from telegram.error import TelegramError
+from telegram.error import TelegramError, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -29,6 +29,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.request import HTTPXRequest
 
 import config
 from article_filters import (
@@ -67,7 +68,14 @@ from fetch import (
 )
 from gui_service import deep_research
 from pronunciation_suggest import suggest_pronunciations
-from research import is_google_news_coverage_url, is_research_article_url, split_research_display
+from research import (
+    RESEARCH_LENGTH_PRESETS,
+    ResearchOptions,
+    answer_research_followup,
+    is_google_news_coverage_url,
+    is_research_article_url,
+    split_research_display,
+)
 from tts import (
     is_speak_phrase,
     split_mp3_for_telegram,
@@ -87,6 +95,8 @@ from watchlist import (
     format_site_digest,
 )
 from watchlist_store import (
+    format_quiet_hours,
+    is_quiet_hours,
     DEFAULT_CHECK_INTERVAL_MINUTES,
     WatchedSite,
     get_site,
@@ -244,6 +254,11 @@ PENDING_FIND_SESSION: dict[str, "PendingFindSession"] = {}
 PENDING_WATCH_POST: dict[str, "PendingWatchPost"] = {}
 PENDING_ELIMINATE_PHRASE: dict[int, "PendingEliminatePhrase"] = {}
 PENDING_ELIMINATE_DELETE: dict[str, "PendingEliminateDelete"] = {}
+PENDING_COMMAND: dict[int, "PendingCommand"] = {}
+PENDING_RESEARCH_CHAT: dict[int, "PendingResearchChat"] = {}
+
+_COMMAND_PENDING_TTL = 30 * 60
+_RESEARCH_CHAT_TTL = 24 * 3600
 
 # Inline actions after an article is delivered (callback_data must be <= 64 bytes).
 _CALLBACK_SPEAK = "a:speak"
@@ -368,6 +383,31 @@ class PendingEliminateDelete:
     expires_monotonic: float
 
 
+@dataclass
+class PendingCommand:
+    """Multi-step Telegram command (research, watch_add, etc.)."""
+
+    user_id: int
+    command: str
+    step: str
+    data: dict = field(default_factory=dict)
+    expires_monotonic: float = 0.0
+
+
+@dataclass
+class PendingResearchChat:
+    """Follow-up Q&A after a deep-research article."""
+
+    user_id: int
+    topic: str
+    headline: str
+    article_body: str
+    source_titles: list[str]
+    source_urls: list[str]
+    history: list[tuple[str, str]] = field(default_factory=list)
+    expires_monotonic: float = 0.0
+
+
 def _allowed_user(user_id: int) -> bool:
     if not config.ALLOWED_TELEGRAM_USER_IDS:
         return False
@@ -463,6 +503,34 @@ async def _bot_send_text(
     if cid is None:
         return
     await context.bot.send_message(cid, text)
+
+
+async def _send_audio(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    audio: InputFile | object,
+    **kwargs: object,
+) -> Message | None:
+    """
+    Send audio with generous upload timeouts.
+
+    Returns the Telegram Message on success, or None on TimedOut (the file may
+    still arrive — python-telegram-bot defaults are too short for large MP3s).
+    """
+    try:
+        return await context.bot.send_audio(
+            chat_id,
+            audio=audio,
+            write_timeout=float(config.TELEGRAM_WRITE_TIMEOUT),
+            read_timeout=float(config.TELEGRAM_READ_TIMEOUT),
+            **kwargs,
+        )
+    except TimedOut:
+        logger.warning(
+            "send_audio timed out for chat %s (Telegram may still deliver the file)",
+            chat_id,
+        )
+        return None
 
 
 # Between logical paragraphs packed into one Telegram message (extract uses \n\n already).
@@ -684,6 +752,12 @@ def _purge_expired_pending() -> None:
     dead_ed = [k for k, v in PENDING_ELIMINATE_DELETE.items() if now > v.expires_monotonic]
     for k in dead_ed:
         del PENDING_ELIMINATE_DELETE[k]
+    expired_cmd = [uid for uid, v in PENDING_COMMAND.items() if now > v.expires_monotonic]
+    for uid in expired_cmd:
+        del PENDING_COMMAND[uid]
+    expired_rc = [uid for uid, v in PENDING_RESEARCH_CHAT.items() if now > v.expires_monotonic]
+    for uid in expired_rc:
+        del PENDING_RESEARCH_CHAT[uid]
 
 
 def _pending_rule_action_put(user_id: int, from_text: str, to_text: str) -> str:
@@ -781,6 +855,110 @@ def _pending_eliminate_phrase_clear(user_id: int) -> None:
     PENDING_ELIMINATE_PHRASE.pop(user_id, None)
 
 
+def _pending_command_put(
+    user_id: int,
+    command: str,
+    *,
+    step: str,
+    data: dict | None = None,
+) -> None:
+    PENDING_COMMAND[user_id] = PendingCommand(
+        user_id=user_id,
+        command=command,
+        step=step,
+        data=dict(data or {}),
+        expires_monotonic=time.monotonic() + _COMMAND_PENDING_TTL,
+    )
+
+
+def _pending_command_get(user_id: int) -> PendingCommand | None:
+    pending = PENDING_COMMAND.get(user_id)
+    if pending is None:
+        return None
+    if time.monotonic() > pending.expires_monotonic:
+        del PENDING_COMMAND[user_id]
+        return None
+    return pending
+
+
+def _pending_command_clear(user_id: int) -> None:
+    PENDING_COMMAND.pop(user_id, None)
+
+
+def _research_chat_put(
+    user_id: int,
+    *,
+    topic: str,
+    headline: str,
+    article_body: str,
+    source_titles: list[str],
+    source_urls: list[str],
+) -> None:
+    PENDING_RESEARCH_CHAT[user_id] = PendingResearchChat(
+        user_id=user_id,
+        topic=topic,
+        headline=headline,
+        article_body=article_body,
+        source_titles=list(source_titles),
+        source_urls=list(source_urls),
+        expires_monotonic=time.monotonic() + _RESEARCH_CHAT_TTL,
+    )
+
+
+def _pending_research_chat_get(user_id: int) -> PendingResearchChat | None:
+    pending = PENDING_RESEARCH_CHAT.get(user_id)
+    if pending is None:
+        return None
+    if time.monotonic() > pending.expires_monotonic:
+        del PENDING_RESEARCH_CHAT[user_id]
+        return None
+    return pending
+
+
+def _pending_research_chat_clear(user_id: int) -> None:
+    PENDING_RESEARCH_CHAT.pop(user_id, None)
+
+
+def _research_article_count_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("10", callback_data="rc:10"),
+                InlineKeyboardButton("25", callback_data="rc:25"),
+                InlineKeyboardButton("50", callback_data="rc:50"),
+            ]
+        ]
+    )
+
+
+def _research_length_keyboard() -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for key, (label, _) in RESEARCH_LENGTH_PRESETS.items():
+        rows.append([InlineKeyboardButton(label, callback_data=f"rl:{key}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _watch_interval_keyboard(*, prefix: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("15 min", callback_data=f"{prefix}:15"),
+                InlineKeyboardButton("30 min", callback_data=f"{prefix}:30"),
+            ],
+            [
+                InlineKeyboardButton("60 min", callback_data=f"{prefix}:60"),
+                InlineKeyboardButton("120 min", callback_data=f"{prefix}:120"),
+            ],
+            [
+                InlineKeyboardButton(
+                    f"Default ({_watch_interval_default()} min)",
+                    callback_data=f"{prefix}:default",
+                )
+            ],
+        ]
+    )
+
+
 def _pending_eliminate_delete_put(user_id: int, domain: str, phrase: str) -> str:
     token = secrets.token_hex(6)
     PENDING_ELIMINATE_DELETE[token] = PendingEliminateDelete(
@@ -843,6 +1021,8 @@ def _clear_user_interactive_state(user_id: int) -> None:
     PENDING_WORD_FIX.pop(user_id, None)
     PENDING_SPEAK_PHRASE.pop(user_id, None)
     PENDING_ELIMINATE_PHRASE.pop(user_id, None)
+    _pending_command_clear(user_id)
+    _pending_research_chat_clear(user_id)
     batch_ids = {p.batch_id for p in PENDING_PRONUNCIATION.values() if p.user_id == user_id}
     for token in [t for t, p in PENDING_PRONUNCIATION.items() if p.user_id == user_id]:
         _pending_pronunciation_remove(token)
@@ -1142,6 +1322,7 @@ async def _start_word_fix_prompt(
     *,
     user_id: int,
     chat_id: int,
+    brief: bool = False,
 ) -> None:
     cached = load_last_article(
         config.ARTICLE_CACHE_DIR,
@@ -1153,11 +1334,17 @@ async def _start_word_fix_prompt(
         cached.title if cached else None,
         cached.text if cached else None,
     )
-    await context.bot.send_message(chat_id, WORD_FIX_HELP)
-    await context.bot.send_message(
-        chat_id,
-        "Reply with the word or short phrase that sounds wrong in the audio.",
-    )
+    if brief:
+        await context.bot.send_message(
+            chat_id,
+            "Which word or phrase sounds wrong in that clip?",
+        )
+    else:
+        await context.bot.send_message(chat_id, WORD_FIX_HELP)
+        await context.bot.send_message(
+            chat_id,
+            "Reply with the word or short phrase that sounds wrong in the audio.",
+        )
 
 
 async def cmd_fixaword(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1176,6 +1363,56 @@ async def cmd_fixaword(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+async def _prompt_research_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id if update.effective_user else 0
+    _pending_command_put(user_id, "research", step="awaiting_topic")
+    await _reply_on_chat(
+        update,
+        context,
+        "What do you want to research?\n\n"
+        "You can send a topic phrase or a Google News Full Coverage link.\n"
+        "Send /nevermind to cancel.",
+    )
+
+
+async def _prompt_research_article_count(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, *, query: str
+) -> None:
+    user_id = update.effective_user.id if update.effective_user else 0
+    _pending_command_put(
+        user_id,
+        "research",
+        step="awaiting_article_count",
+        data={"query": query},
+    )
+    preview = query if len(query) <= 120 else query[:117] + "…"
+    await _reply_on_chat(
+        update,
+        context,
+        f"Researching: {preview}\n\nHow many source articles should I read?",
+        reply_markup=_research_article_count_keyboard(),
+    )
+
+
+async def _prompt_research_length(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, *, query: str, max_articles: int
+) -> None:
+    user_id = update.effective_user.id if update.effective_user else 0
+    _pending_command_put(
+        user_id,
+        "research",
+        step="awaiting_length",
+        data={"query": query, "max_articles": max_articles},
+    )
+    await _reply_on_chat(
+        update,
+        context,
+        f"Reading up to {max_articles} articles.\n\n"
+        "How long should the finished article be?",
+        reply_markup=_research_length_keyboard(),
+    )
+
+
 async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.message:
         return
@@ -1185,22 +1422,20 @@ async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     args = context.args or []
     query = " ".join(args).strip()
     if not query:
-        await update.message.reply_text(
-            "Usage: /research <topic or Google News Full Coverage URL>\n\n"
-            "Examples:\n"
-            "  /research Apple smart glasses launch\n"
-            "  /research US war with Iran\n\n"
-            "You can also paste a news.google.com/stories/… Full Coverage link."
-        )
+        await _prompt_research_topic(update, context)
         return
-    _schedule_research(update, context, query)
+    await _prompt_research_article_count(update, context, query=query)
 
 
 def _schedule_research(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, query: str
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    query: str,
+    *,
+    options: ResearchOptions | None = None,
 ) -> None:
     task = asyncio.create_task(
-        _run_research(update, context, query),
+        _run_research(update, context, query, options=options),
         name="deep-research",
     )
     tasks: set[asyncio.Task] = context.application.bot_data.setdefault("research_tasks", set())
@@ -1261,13 +1496,19 @@ async def _deliver_research_outcome(
 
     await context.bot.send_message(
         chat_id,
-        "Research article ready. Tap Speak to me for audio (Deep research outro).",
+        "Research article ready. Tap Speak to me for audio (Deep research outro).\n"
+        "Ask me follow-up questions about this article in plain text, "
+        "or send /nevermind when you're done.",
         reply_markup=_article_actions_keyboard(),
     )
 
 
 async def _run_research(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, query: str
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    query: str,
+    *,
+    options: ResearchOptions | None = None,
 ) -> None:
     if not update.effective_user:
         return
@@ -1279,6 +1520,8 @@ async def _run_research(
     _pending_word_fix_clear(user_id)
     _pending_speak_phrase_clear(user_id)
     _pending_eliminate_phrase_clear(user_id)
+    _pending_command_clear(user_id)
+    _pending_research_chat_clear(user_id)
 
     status_message: Message | None = None
     try:
@@ -1305,6 +1548,7 @@ async def _run_research(
             query,
             user_id=user_id,
             on_progress=on_progress,
+            options=options,
         )
     except Exception as exc:
         logger.exception("deep research failed")
@@ -1314,6 +1558,17 @@ async def _run_research(
     if outcome.kind != "ok" or not outcome.article:
         await context.bot.send_message(chat_id, outcome.error or "Research failed.")
         return
+
+    headline = outcome.article.title or "Research"
+    body = outcome.article.text or ""
+    _research_chat_put(
+        user_id,
+        topic=query,
+        headline=headline,
+        article_body=body,
+        source_titles=list(outcome.source_titles),
+        source_urls=list(outcome.source_urls),
+    )
 
     if status_message is not None:
         try:
@@ -1342,12 +1597,11 @@ async def cmd_speak(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     args = context.args or []
     if not args:
+        _pending_command_put(update.effective_user.id, "speak", step="awaiting_phrase")
         await update.message.reply_text(
-            "Usage: /speak <sentence or phrase>\n\n"
-            "Example:\n"
-            "  /speak The train arrives at 5 a.m.\n"
-            "  /speak Mesa police responded at 5 a.m. Sunday.\n\n"
-            "Uses your saved pronunciations from tts_replacements.json."
+            "What phrase should I speak?\n\n"
+            "Example: The train arrives at 5 a.m.\n\n"
+            "Send /nevermind to cancel."
         )
         return
 
@@ -1367,8 +1621,17 @@ async def cmd_nevermind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     had_speak = user_id in PENDING_SPEAK_PHRASE
     had_elim = user_id in PENDING_ELIMINATE_PHRASE
     had_samples = any(p.user_id == user_id for p in PENDING_PRONUNCIATION.values())
+    had_command = user_id in PENDING_COMMAND
+    had_research_chat = user_id in PENDING_RESEARCH_CHAT
     _clear_user_interactive_state(user_id)
-    if not (had_word_fix or had_speak or had_samples or had_elim):
+    if not (
+        had_word_fix
+        or had_speak
+        or had_samples
+        or had_elim
+        or had_command
+        or had_research_chat
+    ):
         await update.message.reply_text(
             "Nothing to cancel. Send me a news article URL when you're ready."
         )
@@ -1395,22 +1658,24 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         + domain_note
         + "After each article you can tap Speak to me or Save to disk, "
         "or type those phrases.\n"
-        "Deep research: /research <topic> — Google News → Ollama article\n"
+        "Deep research: /research — I'll ask for a topic, article count, and length\n"
         "  or send a Google News Full Coverage link\n"
+        "After a research article, ask follow-up questions in plain text.\n"
         "After audio is ready, tap Fix a word or send /fixaword to tune pronunciation.\n\n"
         "Commands: /list_domains, /add_domain, /remove_domain, /list_bad_domains, "
         "/override_bad_domain, /fix_403\n"
-        "TTS: /speak <phrase> — hear one sentence with current pronunciations\n"
-        "     /fixaword — reply with a word to fix; /pronounce <word> [alt1 …]\n"
+        "TTS: /speak — test a phrase, then fix-a-word; /fixaword — fix pronunciation in last audio\n"
+        "     /pronounce — preview pronunciation samples for a word\n"
         "     /find_pronunciation <word> — find saved rules; pronounce or delete\n"
         "     /delete_pronunciation <from> — remove a rule from tts_replacements.json\n"
         "     /add_pronunciation <from> <to> — add a rule without audio preview\n"
         "     /nevermind — cancel fix-a-word or other in-progress prompts\n"
         "Filter: /eliminate_phrase — I'll ask for the website, then the phrase to strip\n"
         "        /list_eliminate_phrases [site], /remove_eliminate_phrase <site> <phrase>\n"
-        "Watch: /watch_add <site> [15|30|60|120…] — poll a blog for new posts\n"
-        "       (15/30 fire on those minutes; 60+ at the top of the hour)\n"
-        "       /watch_list, /watch_remove, /watch_interval, /watch_check"
+        "Watch: /watch_add — I'll ask for the site (and check interval)\n"
+        "       /watch_remove and /watch_interval work the same way\n"
+        "       No automatic checks during do-not-disturb hours (default 12am–4am local)\n"
+        "       /watch_list, /watch_check"
     )
 
 
@@ -1453,6 +1718,18 @@ async def cmd_add_domain(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     args = context.args or []
     ok, domain_or_err = _parse_pin_domain(args, usage_cmd="/add_domain")
+    if not ok and not args:
+        step = "awaiting_pin" if config.ADMIN_PIN else "awaiting_domain"
+        _pending_command_put(update.effective_user.id, "add_domain", step=step)
+        if config.ADMIN_PIN:
+            await update.message.reply_text(
+                "What is your admin PIN?\n\nSend /nevermind to cancel."
+            )
+        else:
+            await update.message.reply_text(
+                "Which domain should I add?\n\nSend /nevermind to cancel."
+            )
+        return
     if not ok:
         await update.message.reply_text(domain_or_err or "Bad request.")
         return
@@ -1491,12 +1768,20 @@ async def cmd_fix_403(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         domain = pending.get("domain")
 
     if not domain or not is_valid_registrable_domain(domain):
+        _pending_command_put(
+            update.effective_user.id, "fix_403", step="awaiting_domain"
+        )
+        hint = ""
+        if pending.get("domain"):
+            hint = (
+                f"\n\nOr send /fix_403 right after a blocked article "
+                f"(retries {pending['domain']})."
+            )
         await update.message.reply_text(
-            "Usage: /fix_403 <domain>\n"
-            "Example: /fix_403 politico.com\n\n"
-            "Or send /fix_403 right after a blocked article URL (retries that link).\n"
-            "You can also pass the full URL:\n"
-            "/fix_403 https://www.politico.com/news/..."
+            "Which domain should I record for 403 bypass?\n"
+            "Example: politico.com"
+            + hint
+            + "\n\nSend /nevermind to cancel."
         )
         return
 
@@ -1522,6 +1807,18 @@ async def cmd_remove_domain(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
     args = context.args or []
     ok, domain_or_err = _parse_pin_domain(args, usage_cmd="/remove_domain")
+    if not ok and not args:
+        step = "awaiting_pin" if config.ADMIN_PIN else "awaiting_domain"
+        _pending_command_put(update.effective_user.id, "remove_domain", step=step)
+        if config.ADMIN_PIN:
+            await update.message.reply_text(
+                "What is your admin PIN?\n\nSend /nevermind to cancel."
+            )
+        else:
+            await update.message.reply_text(
+                "Which domain should I remove?\n\nSend /nevermind to cancel."
+            )
+        return
     if not ok:
         await update.message.reply_text(domain_or_err or "Bad request.")
         return
@@ -1577,10 +1874,20 @@ async def cmd_remove_bad_domain(update: Update, context: ContextTypes.DEFAULT_TY
         domain = normalize_registrable_hint(domain_or_err or "")
 
     if not domain or not is_valid_registrable_domain(domain):
+        _pending_command_put(
+            update.effective_user.id, "remove_bad_domain", step="awaiting_domain"
+        )
+        hint = ""
+        if pending.get("domain"):
+            hint = (
+                f"\n\nOr send /remove_bad_domain right after a blocked article "
+                f"(removes {pending['domain']})."
+            )
         await update.message.reply_text(
-            "Usage: /remove_bad_domain <domain>\n"
-            "Example: /remove_bad_domain phys.org\n\n"
-            "Or send /remove_bad_domain right after a blocked article URL."
+            "Which domain should I remove from the bad list?\n"
+            "Example: phys.org"
+            + hint
+            + "\n\nSend /nevermind to cancel."
         )
         return
 
@@ -1628,13 +1935,20 @@ async def cmd_override_bad_domain(update: Update, context: ContextTypes.DEFAULT_
         domain = pending.get("domain")
 
     if not domain or not is_valid_registrable_domain(domain):
+        _pending_command_put(
+            update.effective_user.id, "override_bad_domain", step="awaiting_domain"
+        )
+        hint = ""
+        if pending.get("domain"):
+            hint = (
+                f"\n\nOr send /override_bad_domain right after a blocked article "
+                f"(retries {pending['domain']})."
+            )
         await update.message.reply_text(
-            "Usage: /override_bad_domain <domain>\n"
-            "Example: /override_bad_domain phys.org\n\n"
-            "Or send /override_bad_domain right after a blocked article URL "
-            "(retries that link without removing it from the bad list).\n"
-            "You can also pass the full URL:\n"
-            "/override_bad_domain https://phys.org/news/..."
+            "Which bad-list domain should I temporarily override?\n"
+            "Example: phys.org"
+            + hint
+            + "\n\nSend /nevermind to cancel."
         )
         return
 
@@ -1940,16 +2254,29 @@ async def _run_speak_phrase(
     title = phrase[:64]
     try:
         with out_path.open("rb") as audio_file:
-            await context.bot.send_audio(
+            await _send_audio(
+                context,
                 chat_id,
-                audio=audio_file,
+                audio_file,
                 title=title,
                 performer="News Catcher",
             )
     except TelegramError as e:
         await _bot_send_text(update, context, f"Could not send audio: {e}", chat_id=chat_id)
+        return
     finally:
         out_path.unlink(missing_ok=True)
+
+    save_last_article(
+        config.ARTICLE_CACHE_DIR,
+        user_id,
+        "speak:test",
+        "Test phrase",
+        phrase,
+    )
+    await _start_word_fix_prompt(
+        context, user_id=user_id, chat_id=chat_id, brief=True
+    )
 
 
 async def _run_speak(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2023,9 +2350,10 @@ async def _run_speak(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         try:
             with part.open("rb") as audio_file:
-                await context.bot.send_audio(
+                await _send_audio(
+                    context,
                     chat_id,
-                    audio=InputFile(audio_file, filename=filename),
+                    InputFile(audio_file, filename=filename),
                     title=part_title,
                     performer="News Catcher",
                 )
@@ -2115,9 +2443,10 @@ async def _send_pronunciation_samples(
             label = f"Save → {alt!r}"
         try:
             with out_path.open("rb") as audio_file:
-                sent = await context.bot.send_audio(
+                sent = await _send_audio(
+                    context,
                     chat_id,
-                    audio=audio_file,
+                    audio_file,
                     title=f"Pronounce: {alt}",
                     caption=(
                         f"Hear how {alt!r} sounds.\n"
@@ -2131,6 +2460,9 @@ async def _send_pronunciation_samples(
             continue
         finally:
             out_path.unlink(missing_ok=True)
+
+        if sent is None:
+            continue
 
         token = _pending_pronunciation_put(
             user_id,
@@ -2276,10 +2608,22 @@ async def cmd_add_pronunciation(update: Update, context: ContextTypes.DEFAULT_TY
         return
     args = context.args or []
     if len(args) < 2:
+        if not args:
+            _pending_command_put(
+                update.effective_user.id, "add_pronunciation", step="awaiting_from"
+            )
+            await update.message.reply_text(
+                "Which word or phrase should be replaced?\n\nSend /nevermind to cancel."
+            )
+            return
+        _pending_command_put(
+            update.effective_user.id,
+            "add_pronunciation",
+            step="awaiting_to",
+            data={"from_text": args[0]},
+        )
         await update.message.reply_text(
-            "Usage: /add_pronunciation <from> <to>\n"
-            "Example: /add_pronunciation U.S. United States\n"
-            "Example: /add_pronunciation Polish Poleish"
+            f"How should {args[0]!r} be pronounced?\n\nSend /nevermind to cancel."
         )
         return
     from_text = args[0]
@@ -2311,10 +2655,11 @@ async def cmd_find_pronunciation(update: Update, context: ContextTypes.DEFAULT_T
         return
     args = context.args or []
     if not args:
+        _pending_command_put(
+            update.effective_user.id, "find_pronunciation", step="awaiting_query"
+        )
         await update.message.reply_text(
-            "Usage: /find_pronunciation <word or fragment>\n\n"
-            "Example: /find_pronunciation US\n"
-            "Shows the closest saved rules. You can hear them or delete them."
+            "Which word or fragment should I search for?\n\nSend /nevermind to cancel."
         )
         return
 
@@ -2371,10 +2716,11 @@ async def cmd_delete_pronunciation(update: Update, context: ContextTypes.DEFAULT
         return
     args = context.args or []
     if not args:
+        _pending_command_put(
+            update.effective_user.id, "delete_pronunciation", step="awaiting_from"
+        )
         await update.message.reply_text(
-            "Usage: /delete_pronunciation <from>\n"
-            "Example: /delete_pronunciation a.m.\n\n"
-            "Or use /find_pronunciation <word> and tap Delete."
+            "Which pronunciation rule should I delete?\n\nSend /nevermind to cancel."
         )
         return
     from_text = " ".join(args).strip()
@@ -2522,14 +2868,9 @@ async def cmd_pronounce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     args = context.args or []
     if len(args) < 1:
+        _pending_command_put(update.effective_user.id, "pronounce", step="awaiting_word")
         await update.message.reply_text(
-            "Usage: /pronounce <word-in-article> [<how-to-say-it> …]\n\n"
-            "With one word, Ollama suggests spellings to try.\n"
-            "Example:\n"
-            "  /pronounce Polish\n"
-            "  /pronounce Polish Poleish Pole-ish\n\n"
-            "You get a short audio clip per spelling. Tap Save on the one you want.\n\n"
-            "Or tap Fix a word after audio is sent, or use /add_pronunciation to skip audio."
+            "Which word should I help you pronounce?\n\nSend /nevermind to cancel."
         )
         return
 
@@ -2783,6 +3124,362 @@ async def on_article_action_callback(
         await _start_word_fix_prompt(context, user_id=user_id, chat_id=chat_id)
 
 
+async def _answer_research_question(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat: PendingResearchChat,
+    question: str,
+) -> None:
+    if not update.message:
+        return
+    from briefing.synthesize import ArticleSnippet
+
+    await update.message.reply_text("Thinking…")
+    sources = [
+        ArticleSnippet(
+            title=title,
+            url=url,
+            source=urlparse(url).hostname or "",
+            text="",
+        )
+        for title, url in zip(chat.source_titles, chat.source_urls)
+    ]
+    try:
+        answer, warning = await asyncio.to_thread(
+            answer_research_followup,
+            topic=chat.topic,
+            headline=chat.headline,
+            article_body=chat.article_body,
+            sources=sources,
+            question=question,
+            conversation_history=chat.history,
+        )
+    except Exception as exc:
+        logger.exception("research follow-up failed")
+        await update.message.reply_text(f"Could not answer that: {exc}")
+        return
+    if warning:
+        await update.message.reply_text(warning)
+    chat.history.append((question, answer))
+    chat.expires_monotonic = time.monotonic() + _RESEARCH_CHAT_TTL
+    PENDING_RESEARCH_CHAT[chat.user_id] = chat
+    for msg in _format_article_chunks(answer, config.TELEGRAM_CHUNK_CHARS):
+        try:
+            await update.message.reply_text(msg)
+        except TelegramError:
+            await update.message.reply_text(msg)
+
+
+async def _handle_pending_command_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, text: str
+) -> bool:
+    if not update.effective_user or not update.message:
+        return False
+    user_id = update.effective_user.id
+    pending = _pending_command_get(user_id)
+    if pending is None:
+        return False
+    if text.startswith("/"):
+        await update.message.reply_text(
+            "Still finishing that command. Reply with plain text, or send /nevermind to cancel."
+        )
+        return True
+
+    command = pending.command
+    step = pending.step
+
+    if command == "research" and step == "awaiting_topic":
+        if not text.strip():
+            await update.message.reply_text("Please send a topic or Google News Full Coverage link.")
+            return True
+        _pending_command_clear(user_id)
+        await _prompt_research_article_count(update, context, query=text.strip())
+        return True
+
+    if command == "speak" and step == "awaiting_phrase":
+        _pending_command_clear(user_id)
+        await _run_speak_phrase(update, context, text)
+        return True
+
+    if command == "pronounce" and step == "awaiting_word":
+        _pending_command_clear(user_id)
+        context.args = [text.strip()]
+        await cmd_pronounce(update, context)
+        return True
+
+    if command == "add_pronunciation" and step == "awaiting_from":
+        from_text = text.strip()
+        if not from_text:
+            await update.message.reply_text("Send the word or phrase to replace.")
+            return True
+        _pending_command_put(
+            user_id,
+            "add_pronunciation",
+            step="awaiting_to",
+            data={"from_text": from_text},
+        )
+        await update.message.reply_text(f"How should {from_text!r} be pronounced?")
+        return True
+
+    if command == "add_pronunciation" and step == "awaiting_to":
+        from_text = str(pending.data.get("from_text") or "").strip()
+        to_text = text.strip()
+        if not from_text or not to_text:
+            _pending_command_clear(user_id)
+            await update.message.reply_text("Session expired. Send /add_pronunciation again.")
+            return True
+        _pending_command_clear(user_id)
+        context.args = [from_text, to_text]
+        await cmd_add_pronunciation(update, context)
+        return True
+
+    if command == "find_pronunciation" and step == "awaiting_query":
+        _pending_command_clear(user_id)
+        context.args = text.split()
+        await cmd_find_pronunciation(update, context)
+        return True
+
+    if command == "delete_pronunciation" and step == "awaiting_from":
+        _pending_command_clear(user_id)
+        context.args = text.split()
+        await cmd_delete_pronunciation(update, context)
+        return True
+
+    if command in {"add_domain", "remove_domain"} and step == "awaiting_pin":
+        if text.strip() != config.ADMIN_PIN:
+            await update.message.reply_text("Invalid PIN. Try again or send /nevermind.")
+            return True
+        _pending_command_put(
+            user_id, command, step="awaiting_domain", data={"pin": text.strip()}
+        )
+        await update.message.reply_text("Which domain?")
+        return True
+
+    if command == "add_domain" and step == "awaiting_domain":
+        _pending_command_clear(user_id)
+        context.args = [text.strip()] if not config.ADMIN_PIN else [config.ADMIN_PIN, text.strip()]
+        await cmd_add_domain(update, context)
+        return True
+
+    if command == "remove_domain" and step == "awaiting_domain":
+        _pending_command_clear(user_id)
+        context.args = [text.strip()] if not config.ADMIN_PIN else [config.ADMIN_PIN, text.strip()]
+        await cmd_remove_domain(update, context)
+        return True
+
+    if command == "watch_add" and step == "awaiting_website":
+        domain = domain_hint_from_user_input(text)
+        if not domain or not is_valid_registrable_domain(domain):
+            await update.message.reply_text(
+                "That doesn't look like a valid domain. Try hackaday.com"
+            )
+            return True
+        domain = normalize_registrable_hint(domain)
+        _pending_command_put(
+            user_id,
+            "watch_add",
+            step="awaiting_interval",
+            data={"domain": domain},
+        )
+        await update.message.reply_text(
+            f"How often should I check {domain}?",
+            reply_markup=_watch_interval_keyboard(prefix="wa"),
+        )
+        return True
+
+    if command == "watch_remove" and step == "awaiting_website":
+        domain = domain_hint_from_user_input(text)
+        if not domain:
+            await update.message.reply_text("Could not parse domain.")
+            return True
+        domain = normalize_registrable_hint(domain)
+        _pending_command_clear(user_id)
+        context.args = [domain]
+        await cmd_watch_remove(update, context)
+        return True
+
+    if command == "watch_interval" and step == "awaiting_website":
+        domain = domain_hint_from_user_input(text)
+        if not domain:
+            await update.message.reply_text("Could not parse domain.")
+            return True
+        domain = normalize_registrable_hint(domain)
+        _pending_command_put(
+            user_id,
+            "watch_interval",
+            step="awaiting_interval",
+            data={"domain": domain},
+        )
+        await update.message.reply_text(
+            f"How often should I check {domain}?",
+            reply_markup=_watch_interval_keyboard(prefix="wi"),
+        )
+        return True
+
+    if command == "fix_403" and step == "awaiting_domain":
+        _pending_command_clear(user_id)
+        context.args = text.split()
+        await cmd_fix_403(update, context)
+        return True
+
+    if command == "remove_bad_domain" and step == "awaiting_domain":
+        _pending_command_clear(user_id)
+        context.args = text.split()
+        await cmd_remove_bad_domain(update, context)
+        return True
+
+    if command == "override_bad_domain" and step == "awaiting_domain":
+        _pending_command_clear(user_id)
+        context.args = text.split()
+        await cmd_override_bad_domain(update, context)
+        return True
+
+    return False
+
+
+async def on_research_config_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    if not query or not query.data or not update.effective_user:
+        return
+    if not _allowed_user(update.effective_user.id):
+        await query.answer("Not authorized.", show_alert=True)
+        return
+    data = query.data
+    user_id = update.effective_user.id
+    pending = _pending_command_get(user_id)
+    if pending is None or pending.command != "research":
+        await query.answer("Session expired. Send /research again.", show_alert=True)
+        return
+
+    if data.startswith("rc:"):
+        try:
+            count = int(data[3:])
+        except ValueError:
+            await query.answer("Invalid choice.", show_alert=True)
+            return
+        if count not in (10, 25, 50):
+            await query.answer("Invalid choice.", show_alert=True)
+            return
+        query_text = str(pending.data.get("query") or "").strip()
+        if not query_text:
+            await query.answer("Session expired.", show_alert=True)
+            return
+        await query.answer()
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except TelegramError:
+            pass
+        await _prompt_research_length(
+            update, context, query=query_text, max_articles=count
+        )
+        return
+
+    if data.startswith("rl:"):
+        key = data[3:]
+        preset = RESEARCH_LENGTH_PRESETS.get(key)
+        if preset is None:
+            await query.answer("Invalid choice.", show_alert=True)
+            return
+        query_text = str(pending.data.get("query") or "").strip()
+        try:
+            max_articles = int(pending.data.get("max_articles") or 10)
+        except (TypeError, ValueError):
+            max_articles = 10
+        if not query_text:
+            await query.answer("Session expired.", show_alert=True)
+            return
+        label, words = preset
+        opts = ResearchOptions(
+            max_articles=max_articles,
+            target_words=words,
+            length_label=label,
+        ).normalized()
+        _pending_command_clear(user_id)
+        await query.answer()
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except TelegramError:
+            pass
+        chat_id = _action_chat_id(update)
+        if chat_id is not None:
+            await context.bot.send_message(
+                chat_id,
+                f"Starting research on {query_text!r} "
+                f"({opts.max_articles} articles, {opts.length_label})…",
+            )
+        _schedule_research(update, context, query_text, options=opts)
+
+
+async def on_watch_interval_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    if not query or not query.data or not update.effective_user:
+        return
+    if not _allowed_user(update.effective_user.id):
+        await query.answer("Not authorized.", show_alert=True)
+        return
+    data = query.data
+    user_id = update.effective_user.id
+    pending = _pending_command_get(user_id)
+    if pending is None:
+        await query.answer("Session expired.", show_alert=True)
+        return
+
+    if data.startswith("wa:"):
+        if pending.command != "watch_add" or pending.step != "awaiting_interval":
+            await query.answer("Session expired.", show_alert=True)
+            return
+        domain = str(pending.data.get("domain") or "")
+        choice = data[3:]
+    elif data.startswith("wi:"):
+        if pending.command != "watch_interval" or pending.step != "awaiting_interval":
+            await query.answer("Session expired.", show_alert=True)
+            return
+        domain = str(pending.data.get("domain") or "")
+        choice = data[3:]
+    else:
+        return
+
+    if not domain:
+        await query.answer("Session expired.", show_alert=True)
+        return
+
+    if choice == "default":
+        minutes = _watch_interval_default()
+    else:
+        try:
+            minutes = normalize_check_interval(int(choice))
+        except ValueError:
+            await query.answer("Invalid interval.", show_alert=True)
+            return
+
+    _pending_command_clear(user_id)
+    await query.answer()
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except TelegramError:
+        pass
+
+    if data.startswith("wa:"):
+        await _commit_watch_add(update, context, domain, minutes)
+        return
+
+    site = set_interval(config.WATCHLIST_FILE, domain, minutes)
+    chat_id = _action_chat_id(update)
+    if chat_id is None:
+        return
+    if site is None:
+        await context.bot.send_message(chat_id, f"{domain} is not on the watchlist.")
+    else:
+        await context.bot.send_message(
+            chat_id,
+            f"{domain} will be checked every {site.check_interval_minutes} minutes.",
+        )
+
+
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.message or not update.message.text:
         return
@@ -2800,6 +3497,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     user_id = update.effective_user.id
+    if await _handle_pending_command_message(update, context, text):
+        return
+
     pending_elim = _pending_eliminate_phrase_get(user_id)
     if pending_elim is not None:
         if text.startswith("/"):
@@ -2947,13 +3647,18 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     url = _extract_first_url(text)
     if not url:
+        research_chat = _pending_research_chat_get(user_id)
+        if research_chat and not text.startswith("/"):
+            await _answer_research_question(update, context, research_chat, text)
         return
 
     _pending_word_fix_clear(user_id)
     _pending_speak_phrase_clear(user_id)
     _pending_eliminate_phrase_clear(user_id)
+    _pending_command_clear(user_id)
+    _pending_research_chat_clear(user_id)
     if is_google_news_coverage_url(url):
-        _schedule_research(update, context, url)
+        await _prompt_research_article_count(update, context, query=url)
         return
     await _deliver_user_url_fetch(update, context, url, offer_domain_prompt=True)
 
@@ -3119,6 +3824,39 @@ def _watch_interval_default() -> int:
     )
 
 
+async def _commit_watch_add(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    domain: str,
+    interval: int,
+) -> None:
+    existing = get_site(config.WATCHLIST_FILE, domain)
+    site = WatchedSite(
+        domain=domain,
+        check_interval_minutes=interval,
+        feed_url=existing.feed_url if existing else None,
+        last_checked_at=existing.last_checked_at if existing else 0.0,
+        posts=list(existing.posts) if existing else [],
+    )
+    upsert_site(config.WATCHLIST_FILE, site)
+
+    approved = load_domains(config.DOMAINS_FILE)
+    if domain not in approved:
+        approved.add(domain)
+        save_domains(config.DOMAINS_FILE, approved)
+
+    await _reply_on_chat(
+        update,
+        context,
+        f"Watching {domain} every {site.check_interval_minutes} minutes "
+        f"(clock-aligned).\n"
+        f"Also added to approved domains if needed.\n"
+        f"Saved to {config.WATCHLIST_FILE.resolve()}\n\n"
+        "First check seeds recent posts without notifications. "
+        "Use /watch_check to poll now.",
+    )
+
+
 async def cmd_watch_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.message:
         return
@@ -3130,16 +3868,13 @@ async def cmd_watch_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     args = context.args or []
     if not args:
+        _pending_command_put(
+            update.effective_user.id, "watch_add", step="awaiting_website"
+        )
         await update.message.reply_text(
-            "Usage: /watch_add <website> [15|30|60|120…]\n\n"
-            "Example:\n"
-            "  /watch_add hackaday.com\n"
-            "  /watch_add marktechpost.com 30\n"
-            "  /watch_add example.com 120\n\n"
-            "15 or 30 minutes: checks on those clock marks (:00/:15/:30/:45 or :00/:30).\n"
-            "60, 120, … minutes: checks at the top of the hour.\n"
-            "New posts from a site arrive in one message. Default interval: "
-            f"{_watch_interval_default()} minutes."
+            "Which website should I watch for new posts?\n\n"
+            "Example: hackaday.com\n\n"
+            "Send /nevermind to cancel."
         )
         return
 
@@ -3151,6 +3886,19 @@ async def cmd_watch_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     domain = normalize_registrable_hint(domain)
 
+    if len(args) == 1:
+        _pending_command_put(
+            update.effective_user.id,
+            "watch_add",
+            step="awaiting_interval",
+            data={"domain": domain},
+        )
+        await update.message.reply_text(
+            f"How often should I check {domain}?",
+            reply_markup=_watch_interval_keyboard(prefix="wa"),
+        )
+        return
+
     interval = _watch_interval_default()
     if len(args) >= 2:
         try:
@@ -3161,30 +3909,7 @@ async def cmd_watch_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             )
             return
 
-    existing = get_site(config.WATCHLIST_FILE, domain)
-    site = WatchedSite(
-        domain=domain,
-        check_interval_minutes=interval,
-        feed_url=existing.feed_url if existing else None,
-        last_checked_at=existing.last_checked_at if existing else 0.0,
-        posts=list(existing.posts) if existing else [],
-    )
-    upsert_site(config.WATCHLIST_FILE, site)
-
-    # Ensure fetch/read works for this host.
-    approved = load_domains(config.DOMAINS_FILE)
-    if domain not in approved:
-        approved.add(domain)
-        save_domains(config.DOMAINS_FILE, approved)
-
-    await update.message.reply_text(
-        f"Watching {domain} every {site.check_interval_minutes} minutes "
-        f"(clock-aligned).\n"
-        f"Also added to approved domains if needed.\n"
-        f"Saved to {config.WATCHLIST_FILE.resolve()}\n\n"
-        "First check seeds recent posts without notifications. "
-        "Use /watch_check to poll now."
-    )
+    await _commit_watch_add(update, context, domain, interval)
 
 
 async def cmd_watch_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3200,6 +3925,12 @@ async def cmd_watch_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
     lines = ["Watched blogs:"]
+    if config.WATCHLIST_DND_ENABLED:
+        lines.append(
+            "Do not disturb: "
+            f"{format_quiet_hours(config.WATCHLIST_DND_START_HOUR, config.WATCHLIST_DND_END_HOUR)} "
+            "(local time)"
+        )
     for site in sites:
         feed = site.feed_url or "(auto-discover)"
         lines.append(
@@ -3217,7 +3948,12 @@ async def cmd_watch_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     args = context.args or []
     if not args:
-        await update.message.reply_text("Usage: /watch_remove <website>")
+        _pending_command_put(
+            update.effective_user.id, "watch_remove", step="awaiting_website"
+        )
+        await update.message.reply_text(
+            "Which website should I stop watching?\n\nSend /nevermind to cancel."
+        )
         return
     domain = domain_hint_from_user_input(args[0])
     if not domain:
@@ -3238,9 +3974,28 @@ async def cmd_watch_interval(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     args = context.args or []
     if len(args) < 2:
+        if not args:
+            _pending_command_put(
+                update.effective_user.id, "watch_interval", step="awaiting_website"
+            )
+            await update.message.reply_text(
+                "Which watched website should I change?\n\nSend /nevermind to cancel."
+            )
+            return
+        domain = domain_hint_from_user_input(args[0])
+        if not domain:
+            await update.message.reply_text("Could not parse domain.")
+            return
+        domain = normalize_registrable_hint(domain)
+        _pending_command_put(
+            update.effective_user.id,
+            "watch_interval",
+            step="awaiting_interval",
+            data={"domain": domain},
+        )
         await update.message.reply_text(
-            "Usage: /watch_interval <website> <15|30|60|120…>\n"
-            "Example: /watch_interval hackaday.com 30"
+            f"How often should I check {domain}?",
+            reply_markup=_watch_interval_keyboard(prefix="wi"),
         )
         return
     domain = domain_hint_from_user_input(args[0])
@@ -3324,6 +4079,15 @@ def _watch_post_picker_keyboard(token: str, posts: list[CandidatePost]) -> Inlin
 
 async def _run_watchlist_checks(app: Application, *, force: bool = False) -> None:
     if not config.WATCHLIST_ENABLED:
+        return
+    if (
+        not force
+        and config.WATCHLIST_DND_ENABLED
+        and is_quiet_hours(
+            config.WATCHLIST_DND_START_HOUR,
+            config.WATCHLIST_DND_END_HOUR,
+        )
+    ):
         return
     sites = load_watchlist(config.WATCHLIST_FILE)
     if not sites:
@@ -3755,8 +4519,8 @@ async def _post_init(app: Application) -> None:
         await app.bot.set_my_commands(
             [
                 BotCommand("start", "Help and how to use the bot"),
-                BotCommand("speak", "Test a phrase with current pronunciations"),
-                BotCommand("research", "Deep research: topic or Full Coverage URL"),
+                BotCommand("speak", "Test a phrase, then fix pronunciation"),
+                BotCommand("research", "Deep research: topic, sources, and length"),
                 BotCommand("fixaword", "Fix a mispronounced word in the last audio"),
                 BotCommand("pronounce", "Preview pronunciation samples for a word"),
                 BotCommand("find_pronunciation", "Find saved rules; pronounce or delete"),
@@ -3850,6 +4614,14 @@ def main() -> None:
     app = (
         Application.builder()
         .token(config.TELEGRAM_BOT_TOKEN)
+        .request(
+            HTTPXRequest(
+                connect_timeout=float(config.TELEGRAM_CONNECT_TIMEOUT),
+                read_timeout=float(config.TELEGRAM_READ_TIMEOUT),
+                write_timeout=float(config.TELEGRAM_WRITE_TIMEOUT),
+                pool_timeout=float(config.TELEGRAM_POOL_TIMEOUT),
+            )
+        )
         .concurrent_updates(True)
         .post_init(_post_init)
         .post_shutdown(_post_shutdown)
@@ -3884,6 +4656,8 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_rule_action_callback, pattern=r"^r[pdna]:"))
     app.add_handler(CallbackQueryHandler(on_speak_phrase_callback, pattern=r"^s:"))
     app.add_handler(CallbackQueryHandler(on_word_fix_callback, pattern=r"^wf:"))
+    app.add_handler(CallbackQueryHandler(on_research_config_callback, pattern=r"^r[cl]:"))
+    app.add_handler(CallbackQueryHandler(on_watch_interval_callback, pattern=r"^w[ai]:"))
     app.add_handler(CallbackQueryHandler(on_watch_post_callback, pattern=r"^w[rsp]:"))
     app.add_handler(CallbackQueryHandler(on_domain_add_callback, pattern=r"^[yn]:"))
     app.add_handler(CallbackQueryHandler(on_domain_bad_callback, pattern=r"^[bk]:"))

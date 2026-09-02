@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Literal
 from urllib.parse import quote_plus, urlparse
 
@@ -33,6 +33,49 @@ ProgressCallback = Callable[[str], None]
 SOURCES_DIVIDER = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 
+RESEARCH_ARTICLE_COUNTS: tuple[int, ...] = (10, 25, 50)
+
+RESEARCH_LENGTH_PRESETS: dict[str, tuple[str, int]] = {
+    "short": ("Under 500 words", 400),
+    "medium": ("500–1200 words", 900),
+    "long": ("Over 1200 words", 1500),
+    "essay": ("5000 word essay", 5000),
+}
+
+
+@dataclass
+class ResearchOptions:
+    """User-selected research parameters."""
+
+    max_articles: int = 10
+    target_words: int = 900
+    length_label: str = "500–1200 words"
+
+    def normalized(self) -> ResearchOptions:
+        count = self.max_articles
+        if count not in RESEARCH_ARTICLE_COUNTS:
+            count = min(RESEARCH_ARTICLE_COUNTS, key=lambda n: abs(n - count))
+        label = self.length_label
+        words = self.target_words
+        by_label = {text: w for text, w in RESEARCH_LENGTH_PRESETS.values()}
+        if label in by_label:
+            words = by_label[label]
+        else:
+            ordered = list(RESEARCH_LENGTH_PRESETS.values())
+            label, words = ordered[1]
+            for preset_label, preset_words in ordered:
+                if self.target_words <= preset_words:
+                    label, words = preset_label, preset_words
+                    break
+            else:
+                label, words = ordered[-1]
+        return ResearchOptions(
+            max_articles=count,
+            target_words=words,
+            length_label=label,
+        )
+
+
 @dataclass
 class ResearchResult:
     topic: str
@@ -40,6 +83,7 @@ class ResearchResult:
     text: str
     sources: list[ArticleSnippet]
     ollama_warning: str | None = None
+    options: ResearchOptions = field(default_factory=ResearchOptions)
 
 
 def is_google_news_coverage_url(url: str) -> bool:
@@ -305,6 +349,18 @@ async def collect_coverage_items(
     )
 
 
+def _sources_summary_block(snippets: list[ArticleSnippet], *, max_chars: int = 6000) -> str:
+    parts: list[str] = []
+    used = 0
+    for i, snippet in enumerate(snippets, start=1):
+        block = f"- {snippet.title} ({snippet.source})\n  {snippet.url}"
+        if used + len(block) > max_chars:
+            break
+        parts.append(block)
+        used += len(block) + 1
+    return "\n".join(parts)
+
+
 def synthesize_research_article(
     topic: str,
     snippets: list[ArticleSnippet],
@@ -312,6 +368,7 @@ def synthesize_research_article(
     ollama_host: str | None = None,
     ollama_model: str | None = None,
     target_words: int | None = None,
+    length_label: str | None = None,
     timeout_seconds: float | None = None,
 ) -> tuple[str, str, str | None]:
     """
@@ -326,6 +383,7 @@ def synthesize_research_article(
     requested_model = (ollama_model or config.OLLAMA_MODEL).strip()
     timeout = timeout_seconds or float(config.RESEARCH_OLLAMA_TIMEOUT)
     words = target_words or config.RESEARCH_TARGET_WORDS
+    length_desc = length_label or f"about {words} words"
 
     model, warning = resolve_ollama_model(host, requested_model)
     if model is None:
@@ -342,27 +400,27 @@ def synthesize_research_article(
         )
     sources_block = "\n".join(parts)
 
-    prompt = f"""You are a staff reporter writing a finished news article for publication.
+    prompt = f"""You are a professional news writer. Synthesize recent reporting into ONE original news article or essay.
 
 Topic: {topic}
 
-Target length: about {words} words.
+Target length: {length_desc} (aim for roughly {words} words).
 
-Write one standalone news story a reader would find on a news site. Report the events and facts directly in third person. The reader should not be able to tell this was assembled from multiple sources.
+Style and tone:
+- Neutral, "just the facts" journalism. No opinion, editorializing, or sensationalism.
+- Write flowing prose in full paragraphs. This must read like a published news article or essay.
+- NEVER use bullet points, numbered lists, dash lists, or outline-style sections.
+- Open with a strong lead paragraph, then develop the story across multiple connected paragraphs with transitions.
+- Attribute claims to outlets when sources differ (for example, "Reuters reported…", "according to the BBC…").
+- Do not invent facts, quotes, dates, names, or statistics beyond what the sources support.
+- Note uncertainty where sources conflict or leave gaps.
 
-Required format:
-- Line 1 must be exactly: HEADLINE: <compelling news headline>
-- Then the article body only (3–6 paragraphs, no bullet lists).
+Format:
+- First line only: HEADLINE: Your headline here
+- Then the article body (paragraphs only).
+- No markdown, meta commentary, or filler such as "In conclusion".
 
-Style rules:
-- Lead with the most important news. Do not open with framing about coverage, summaries, or "this article."
-- Never write meta phrases such as: "Here's a summary", "This article examines", "Below is an overview", "Multiple outlets report", "According to various sources", "In recent coverage", or "This piece looks at."
-- Attribute specific claims to outlets only when needed for a direct quote or a clear disagreement (e.g. "The Washington Post reported … while Reuters said …"). Do not narrate that you are synthesizing sources.
-- Use plain journalistic prose suitable for reading on screen.
-- Do not invent facts, quotes, or events beyond the source material below.
-- No markdown, labels, stage directions, or commentary about your writing process.
-
-Source material (for your research only — do not refer to it in the article):
+Sources:
 {sources_block}
 """
 
@@ -387,6 +445,70 @@ Source material (for your research only — do not refer to it in the article):
             ).strip()
             break
     return headline, body, warning
+
+
+def answer_research_followup(
+    *,
+    topic: str,
+    headline: str,
+    article_body: str,
+    sources: list[ArticleSnippet],
+    question: str,
+    conversation_history: list[tuple[str, str]] | None = None,
+    ollama_host: str | None = None,
+    ollama_model: str | None = None,
+    timeout_seconds: float | None = None,
+) -> tuple[str, str | None]:
+    """
+    Answer a follow-up question about a research article.
+
+    Returns (answer, ollama_warning).
+    """
+    host = (ollama_host or config.OLLAMA_HOST).rstrip("/")
+    requested_model = (ollama_model or config.OLLAMA_MODEL).strip()
+    timeout = timeout_seconds or float(config.RESEARCH_OLLAMA_TIMEOUT)
+    model, warning = resolve_ollama_model(host, requested_model)
+    if model is None:
+        raise RuntimeError(warning or "Ollama model is not available.")
+
+    sources_block = _sources_summary_block(sources)
+    history_lines: list[str] = []
+    for prior_q, prior_a in conversation_history or []:
+        history_lines.append(f"User: {prior_q}\nAssistant: {prior_a}")
+    history_block = ""
+    if history_lines:
+        history_block = "Prior conversation:\n" + "\n\n".join(history_lines) + "\n\n"
+
+    prompt = f"""You are a research assistant. The user read the following synthesized news article and has a follow-up question.
+
+Article topic: {topic}
+Headline: {headline}
+
+Article:
+{article_body.strip()}
+
+Sources used:
+{sources_block}
+
+Rules:
+- Answer the user's question helpfully and clearly in plain prose paragraphs.
+- Base factual claims on the article and sources above. Do not invent facts.
+- You may offer careful speculation if you clearly label it as speculation or analysis.
+- If the question cannot be answered from the material, say so and explain what is known versus unknown.
+- Do not use bullet points or numbered lists unless the user explicitly asks for a list.
+
+{history_block}User question: {question.strip()}
+"""
+
+    url = f"{host}/api/generate"
+    payload = {"model": model, "prompt": prompt, "stream": False}
+    with httpx.Client(timeout=timeout) as client:
+        resp = client.post(url, json=payload)
+        resp.raise_for_status()
+        raw = (resp.json().get("response") or "").strip()
+    if not raw:
+        raise RuntimeError("Ollama returned an empty answer.")
+    return raw, warning
 
 
 def format_research_display(
@@ -425,6 +547,7 @@ async def run_deep_research_async(
     text: str,
     *,
     on_progress: ProgressCallback | None = None,
+    options: ResearchOptions | None = None,
 ) -> ResearchResult:
     def progress(msg: str) -> None:
         if on_progress:
@@ -432,7 +555,8 @@ async def run_deep_research_async(
 
     mode, value = parse_research_input(text)
     allowed = load_domains(config.DOMAINS_FILE)
-    max_items = config.RESEARCH_MAX_ARTICLES
+    opts = (options or ResearchOptions()).normalized()
+    max_items = opts.max_articles
 
     if mode == "coverage":
         progress("Loading Google News Full Coverage…")
@@ -464,13 +588,19 @@ async def run_deep_research_async(
         )
 
     progress("Writing article with Ollama…")
-    headline, body, warning = synthesize_research_article(topic_label, snippets)
+    headline, body, warning = synthesize_research_article(
+        topic_label,
+        snippets,
+        target_words=opts.target_words,
+        length_label=opts.length_label,
+    )
     return ResearchResult(
         topic=topic_label,
         title=headline,
         text=body,
         sources=snippets,
         ollama_warning=warning,
+        options=opts,
     )
 
 
@@ -478,7 +608,10 @@ def run_deep_research(
     text: str,
     *,
     on_progress: ProgressCallback | None = None,
+    options: ResearchOptions | None = None,
 ) -> ResearchResult:
     import asyncio
 
-    return asyncio.run(run_deep_research_async(text, on_progress=on_progress))
+    return asyncio.run(
+        run_deep_research_async(text, on_progress=on_progress, options=options)
+    )

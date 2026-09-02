@@ -18,7 +18,9 @@ from watchlist_store import (
     WatchedPost,
     WatchedSite,
     current_slot_start,
+    format_quiet_hours,
     is_known_post,
+    is_quiet_hours,
     load_watchlist,
     merge_new_posts,
     normalize_check_interval,
@@ -151,6 +153,26 @@ class TestWatchlistStore(unittest.TestCase):
         site.last_checked_at = datetime(2026, 8, 12, 10, 0, 5).timestamp()
         self.assertFalse(site_is_due(site, now=datetime(2026, 8, 12, 10, 30, 0)))
         self.assertTrue(site_is_due(site, now=datetime(2026, 8, 12, 11, 0, 10)))
+
+
+class TestWatchlistQuietHours(unittest.TestCase):
+    def test_midnight_to_four_am(self) -> None:
+        self.assertTrue(is_quiet_hours(0, 4, now=datetime(2026, 8, 12, 0, 0)))
+        self.assertTrue(is_quiet_hours(0, 4, now=datetime(2026, 8, 12, 3, 59)))
+        self.assertFalse(is_quiet_hours(0, 4, now=datetime(2026, 8, 12, 4, 0)))
+        self.assertFalse(is_quiet_hours(0, 4, now=datetime(2026, 8, 12, 12, 0)))
+
+    def test_overnight_wrap(self) -> None:
+        self.assertTrue(is_quiet_hours(22, 6, now=datetime(2026, 8, 12, 23, 0)))
+        self.assertTrue(is_quiet_hours(22, 6, now=datetime(2026, 8, 12, 5, 30)))
+        self.assertFalse(is_quiet_hours(22, 6, now=datetime(2026, 8, 12, 12, 0)))
+
+    def test_disabled_when_equal(self) -> None:
+        self.assertFalse(is_quiet_hours(0, 0, now=datetime(2026, 8, 12, 2, 0)))
+
+    def test_format_quiet_hours(self) -> None:
+        self.assertEqual(format_quiet_hours(0, 4), "12am–4am")
+        self.assertEqual(format_quiet_hours(22, 6), "10pm–6am")
 
 
 class TestWatchlistHelpers(unittest.TestCase):

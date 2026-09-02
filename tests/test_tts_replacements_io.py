@@ -33,3 +33,26 @@ class TestAddLiteralReplacement(unittest.TestCase):
             self.assertFalse(updated)
             rules2 = load_tts_replacement_rules(path, reload=True)
             self.assertEqual(rules2.literals[0].to_text, "Pole-ish")
+
+    def test_reloads_when_file_changes_on_disk(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tts_replacements.json"
+            path.write_text(
+                json.dumps(
+                    {"replacements": [{"from": "A", "to": "Alpha"}], "regex": []}
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            first = load_tts_replacement_rules(path)
+            self.assertEqual(first.literals[0].to_text, "Alpha")
+
+            path.write_text(
+                json.dumps(
+                    {"replacements": [{"from": "A", "to": "Ay"}], "regex": []}
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            second = load_tts_replacement_rules(path)
+            self.assertEqual(second.literals[0].to_text, "Ay")

@@ -33,6 +33,11 @@ def _bool(name: str, default: bool = False) -> bool:
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+# Bot API HTTP timeouts (seconds). write_timeout must cover large MP3 uploads.
+TELEGRAM_CONNECT_TIMEOUT = _int("TELEGRAM_CONNECT_TIMEOUT", 10)
+TELEGRAM_READ_TIMEOUT = _int("TELEGRAM_READ_TIMEOUT", 60)
+TELEGRAM_WRITE_TIMEOUT = _int("TELEGRAM_WRITE_TIMEOUT", 300)
+TELEGRAM_POOL_TIMEOUT = _int("TELEGRAM_POOL_TIMEOUT", 10)
 ALLOWED_TELEGRAM_USER_IDS: frozenset[int] = frozenset(
     int(x.strip())
     for x in os.environ.get("ALLOWED_TELEGRAM_USER_IDS", "").split(",")
@@ -204,3 +209,7 @@ if not WATCHLIST_FILE.is_absolute():
     WATCHLIST_FILE = PROJECT_ROOT / WATCHLIST_FILE
 WATCHLIST_TICK_SECONDS = _int("WATCHLIST_TICK_SECONDS", 60)
 WATCHLIST_DEFAULT_INTERVAL_MINUTES = _int("WATCHLIST_DEFAULT_INTERVAL_MINUTES", 60)
+# Local-time quiet hours: no automatic polls or Telegram digests (manual /watch_check still runs).
+WATCHLIST_DND_ENABLED = _bool("WATCHLIST_DND_ENABLED", True)
+WATCHLIST_DND_START_HOUR = _int("WATCHLIST_DND_START_HOUR", 0)
+WATCHLIST_DND_END_HOUR = _int("WATCHLIST_DND_END_HOUR", 4)

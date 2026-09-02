@@ -21,14 +21,18 @@ Ideas to build on top of the News Catcher Telegram bot (URL in → article text 
 | TTS / audio | Done (`tts.py` + Telegram `send_audio`) |
 | Multi-source briefing / LLM synthesis | Done (`briefing/` → Google Drive) |
 | Deep research (Google News → Ollama article) | Done (`research.py`, Telegram `/research`, GUI) |
+| Blog watchlist (RSS/WordPress digests) | Done (`watchlist.py`, Telegram `/watch_*`) |
+| Conversational Telegram commands | Done (`News_bot.py`) |
 
 ---
 
 ## Deep research (implemented)
 
-On-demand topic research: Google News RSS or Full Coverage → fetch allowlisted articles → Ollama writes a published-style story → optional TTS with a News Catcher Deep research outro.
+On-demand topic research: Google News RSS or Full Coverage → fetch allowlisted articles → Ollama writes neutral prose (article/essay, not bullet lists) → optional TTS with a News Catcher Deep research outro → follow-up Q&A in Telegram.
 
-See [README.md](../README.md#deep-research) for usage (`/research`, GUI, env vars).
+Telegram `/research` is conversational (topic, article count, length). GUI uses env defaults.
+
+See [README.md](../README.md#deep-research) for usage.
 
 ---
 
@@ -43,7 +47,7 @@ See [README.md](../README.md#deep-research) for usage (`/research`, GUI, env var
 ### Implementation notes
 
 - **Last-article cache** (`article_cache.py`): After a successful extract, store `user_id`, `url`, `title`, `text`, `timestamp`. Prefer disk (JSON/SQLite) so bot restarts do not lose state. TTL e.g. 24–72 hours. Error if empty: *"No recent article. Send a URL first."*
-- **Speak trigger** in `News_bot.py`: Detect phrase before the URL-only early return. Example pattern: `^newscatcher\s*,?\s*speak\s+to\s+me\s*$`. Optional later: `/speak` or reply-to-URL.
+- **Speak trigger** in `News_bot.py`: Detect phrase before the URL-only early return. Example pattern: `^newscatcher\s*,?\s*speak\s+to\s+me\s*$`. `/speak` tests a phrase and starts fix-a-word.
 - **TTS** (`tts.py`): KittenTTS — chunk long text, synthesize per chunk, concat with ffmpeg into one MP3. Prepend title. Run in `asyncio.to_thread()`; `send_chat_action(upload_audio)` while working.
 - **Delivery**: `bot.send_audio` with title/performer. Telegram limit ~50 MB per file. Email via SMTP only if needed for huge files or preference.
 

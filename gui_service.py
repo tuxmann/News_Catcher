@@ -6,7 +6,7 @@ import asyncio
 import logging
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urlparse
@@ -35,7 +35,12 @@ from fetch import (
     fetch_url,
 )
 from pronunciation_suggest import suggest_pronunciations
-from research import format_research_display, is_research_article_url, run_deep_research
+from research import (
+    ResearchOptions,
+    format_research_display,
+    is_research_article_url,
+    run_deep_research,
+)
 from tts import synthesize_pronunciation_sample, synthesize_to_mp3
 from tts_branding import build_deep_research_outro_text
 from tts_normalize import add_literal_replacement
@@ -179,6 +184,8 @@ class DeepResearchOutcome:
     article: ArticleResult | None = None
     error: str | None = None
     warning: str | None = None
+    source_titles: list[str] = field(default_factory=list)
+    source_urls: list[str] = field(default_factory=list)
 
 
 def _run_async(coro):
@@ -359,10 +366,11 @@ def deep_research(
     *,
     user_id: int = GUI_USER_ID,
     on_progress: Callable[[str], None] | None = None,
+    options: ResearchOptions | None = None,
 ) -> DeepResearchOutcome:
     """Search Google News on a topic, synthesize an article with Ollama."""
     try:
-        result = run_deep_research(query, on_progress=on_progress)
+        result = run_deep_research(query, on_progress=on_progress, options=options)
     except ValueError as exc:
         return DeepResearchOutcome(kind="error", error=str(exc))
     except Exception as exc:
@@ -393,6 +401,8 @@ def deep_research(
             display_text=display,
         ),
         warning=result.ollama_warning,
+        source_titles=[s.title for s in result.sources],
+        source_urls=[s.url for s in result.sources],
     )
 
 

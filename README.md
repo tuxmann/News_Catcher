@@ -30,7 +30,8 @@ If you maintain a fork or publish this repo, add [Topics](https://docs.github.co
 - Patchright (stealth Playwright) fallback for Cloudflare-protected domains (default: `economist.com`, `marktechpost.com`)
 - Startup online notification to allowed Telegram users
 - **Speak last article**: after a URL, send `newscatcher, speak to me` for TTS audio (KittenTTS)
-- **Deep research**: Google News topic or Full Coverage → Ollama writes a standalone news article → speak with a custom outro (Telegram `/research` or GUI **Research** button)
+- **Deep research**: conversational `/research` — topic, article count (10/25/50), length preset → Ollama writes a neutral news article → follow-up Q&A → TTS with Deep research outro
+- **Blog watchlist**: poll RSS/WordPress for new posts; do-not-disturb window (default 12am–4am local); Read or Speak digests in Telegram
 - **Overnight briefing** (optional): `python -m briefing` → Google Drive (`briefing.yaml`, see `.env.example`)
 
 ## Example Target Domains
@@ -56,6 +57,8 @@ You can add/remove domains at runtime with bot commands.
 - `domains_store.py` - Load/save domain allowlist and host matching
 - `config.py` - Environment/config loading
 - `domains.json` - Approved domains list
+- `data/watchlist.json` - Watched blogs (created at runtime)
+- `watchlist.py` / `watchlist_store.py` - Blog watchlist: RSS/WordPress polling, DND quiet hours
 - `.env.example` - Example environment configuration
 - `article_cache.py` - Last article per user (for TTS)
 - `tts.py` - KittenTTS + ffmpeg MP3 generation
@@ -178,7 +181,7 @@ KittenTTS cannot disambiguate homographs (e.g. **Polish** the country vs. nail p
 
 1. Edit [`tts_replacements.json`](tts_replacements.json) in the project root (or point elsewhere with `TTS_REPLACEMENTS_FILE` in `.env`).
 2. Keep `TTS_NORMALIZE_ENABLED=1` (default). Set to `0` to pass article text through unchanged.
-3. Restart the bot or re-run `test_article_to_audio.py` after changing the JSON (rules are cached per process).
+3. Save `tts_replacements.json` — the bot reloads it automatically on the next speak (no restart needed).
 
 **File format:**
 
@@ -215,31 +218,47 @@ Normalization runs on Telegram **speak**, overnight **briefing** audio, and `tes
 **Try spellings in Telegram** (writes to `tts_replacements.json`):
 
 ```text
+/speak
+```
+
+The bot asks for a test sentence, sends audio, then starts **fix-a-word** so you can tune what sounded wrong (same flow as `/fixaword` after article audio).
+
+```text
+/pronounce Polish
 /pronounce Polish Poleish Pole-ish
 ```
 
-You get a short audio clip per spelling; tap **Save** on the one you want. Without audio:
+With one word, Ollama suggests spellings. You get a short audio clip per spelling; tap **Save** on the one you want. Without audio:
 
 ```text
 /add_pronunciation Polish Poleish
 ```
 
+After a full **article** speak, tap **Fix a word** or send `/fixaword`.
+
 Article **speak** runs in the background — you can fetch the next URL while audio is generating.
 
 ### Deep research
 
-Deep research collects recent headlines from **Google News** (topic search or a **Full Coverage** link), downloads articles from your `domains.json` allowlist, and asks **Ollama** to write a **standalone news article** (not a meta-summary). Sources are listed at the bottom of the text reply.
+Deep research collects recent headlines from **Google News** (topic search or a **Full Coverage** link), downloads articles from your `domains.json` allowlist, and asks **Ollama** to write a **neutral, just-the-facts news article or essay** in flowing prose (not bullet lists). Sources are listed at the bottom of the text reply.
 
-**Telegram**
+**Telegram (conversational)**
 
 ```text
-/research Apple smart glasses launch
-/research US war with Iran
+/research
 ```
 
-Or paste a Google News Full Coverage URL (`news.google.com/stories/…`) — the bot runs research instead of fetching that page as a single article.
+The bot asks:
+
+1. **Topic** — phrase or Google News Full Coverage URL (`news.google.com/stories/…`)
+2. **Article count** — 10, 25, or 50 source articles
+3. **Length** — Under 500 words, 500–1200 words, Over 1200 words, or 5000 word essay
+
+You can skip step 1 with `/research Apple smart glasses launch` (starts at article count). Pasting a Full Coverage URL in chat also starts research at article count.
 
 Progress updates appear while articles are downloaded and Ollama writes. Then use **Speak to me** or `newscatcher, speak to me`. Research audio ends with: *That's the end from News Catcher's Deep research.*
+
+**Follow-up questions** — After a research article, ask plain-text questions in chat. Answers use the article and sources; speculation is allowed if labeled, but facts are not invented. Send `/nevermind` or a new URL to exit Q&A mode.
 
 **Desktop GUI**
 
@@ -247,7 +266,7 @@ Progress updates appear while articles are downloaded and Ollama writes. Then us
 python gui_app.py
 ```
 
-Enter a topic or Full Coverage URL, tap **Research**, then **speak**.
+Enter a topic or Full Coverage URL, tap **Research**, then **speak**. (GUI uses `RESEARCH_MAX_ARTICLES` and `RESEARCH_TARGET_WORDS` from `.env`; Telegram lets you pick per run.)
 
 **Requirements**
 
@@ -260,21 +279,60 @@ Enter a topic or Full Coverage URL, tap **Research**, then **speak**.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `RESEARCH_MAX_ARTICLES` | `10` | Headlines to fetch per run |
-| `RESEARCH_TARGET_WORDS` | `1000` | Target length for the generated article |
+| `RESEARCH_MAX_ARTICLES` | `10` | Default headline cap (GUI; Telegram asks each run) |
+| `RESEARCH_TARGET_WORDS` | `1000` | Default target length (GUI; Telegram asks each run) |
 | `RESEARCH_OLLAMA_TIMEOUT` | `300` | Seconds to wait for Ollama |
+
+### Blog watchlist
+
+Poll watched blogs for new posts and notify in Telegram.
+
+```text
+/watch_add          → asks for site, then check interval (15/30/60/120 min)
+/watch_remove       → asks which site to stop watching
+/watch_interval     → asks site, then new interval
+/watch_list         → list watched sites and DND window
+/watch_check        → poll all sites now (ignores quiet hours)
+```
+
+One-liners still work: `/watch_add hackaday.com 30`.
+
+**Do not disturb** — By default, automatic polls and digests are skipped from **12am–4am** local time. Manual `/watch_check` still runs. Configure with `WATCHLIST_DND_*` in `.env`.
+
+When new posts arrive, tap **Read** or **Speak** on the digest (one or all posts).
 
 ### Commands
 
-- `/start` - intro/help
-- `/research <topic>` — deep research from a topic or Google News Full Coverage URL
-- `/list_domains` - show approved domains
-- `/add_domain <domain>` or `/add_domain <PIN> <domain>` (if `ADMIN_PIN` is set)
-- `/fix_403 <domain>` — record a 403-blocked site and retry the last failed URL
-- `/pronounce <word> <alt1> [alt2…]` — hear pronunciation options and save to `tts_replacements.json`
-- `/add_pronunciation <from> <to>` — add a rule without generating samples
-- `/remove_domain <domain>` or `/remove_domain <PIN> <domain>` (if `ADMIN_PIN` is set)
-- `/eliminate_phrase` — interactive: asks for the website, then the phrase to strip from that site's articles (also `/list_eliminate_phrases`, `/remove_eliminate_phrase`)
+Many commands work **conversationally**: send the command alone and the bot asks for the rest. Send `/nevermind` to cancel an in-progress prompt.
+
+| Command | With no arguments | With arguments |
+|---------|-------------------|----------------|
+| `/start` | Help | — |
+| `/research` | Topic → count → length | `/research <topic>` skips topic step |
+| `/speak` | Asks phrase → audio → fix-a-word | `/speak <phrase>` |
+| `/pronounce` | Asks word | `/pronounce <word> [alt …]` |
+| `/add_pronunciation` | Asks from → to | `/add_pronunciation <from> <to>` |
+| `/find_pronunciation` | Asks search term | `/find_pronunciation <word>` |
+| `/delete_pronunciation` | Asks rule to delete | `/delete_pronunciation <from>` |
+| `/fixaword` | Fix-a-word on last audio | — |
+| `/eliminate_phrase` | Website → phrase to strip | — |
+| `/watch_add` | Site → interval | `/watch_add <site> [minutes]` |
+| `/watch_remove` | Asks site | `/watch_remove <site>` |
+| `/watch_interval` | Site → interval | `/watch_interval <site> <minutes>` |
+| `/watch_list` | List watchlist | — |
+| `/watch_check` | Poll now | — |
+| `/add_domain` | Asks domain (PIN first if set) | `/add_domain [PIN] <domain>` |
+| `/remove_domain` | Asks domain (PIN first if set) | `/remove_domain [PIN] <domain>` |
+| `/fix_403` | Asks domain (or retries last blocked URL) | `/fix_403 <domain or URL>` |
+| `/remove_bad_domain` | Asks domain | `/remove_bad_domain [PIN] <domain>` |
+| `/override_bad_domain` | Asks domain | `/override_bad_domain <domain or URL>` |
+| `/list_domains` | Show allowlist | — |
+| `/list_bad_domains` | Show bad domains | — |
+| `/list_eliminate_phrases` | List phrase filters | `[site]` to filter |
+| `/remove_eliminate_phrase` | — | `<site> <phrase>` |
+| `/nevermind` | Cancel prompts / research Q&A | — |
+
+**Telegram upload timeouts** — Large MP3 uploads use `TELEGRAM_WRITE_TIMEOUT` (default 300s). Raise in `.env` if sends still time out on slow links.
 
 ## Security Model
 

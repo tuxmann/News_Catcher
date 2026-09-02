@@ -52,6 +52,15 @@ class TtsReplacementRules:
 
 _rules_cache: TtsReplacementRules | None = None
 _rules_cache_path: Path | None = None
+_rules_cache_mtime: float | None = None
+
+
+def _replacements_file_mtime(path: Path) -> float | None:
+    """Modification time for cache invalidation, or None if the file is missing."""
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
 
 
 def _bool_field(raw: object, default: bool) -> bool:
@@ -130,11 +139,17 @@ def _parse_replacements_file(path: Path) -> TtsReplacementRules:
 
 
 def load_tts_replacement_rules(path: Path | None = None, *, reload: bool = False) -> TtsReplacementRules:
-    """Load rules from JSON; cached until path changes or reload=True."""
-    global _rules_cache, _rules_cache_path
+    """Load rules from JSON; reload when the file changes on disk."""
+    global _rules_cache, _rules_cache_path, _rules_cache_mtime
 
     path = (path or config.TTS_REPLACEMENTS_FILE).resolve()
-    if not reload and _rules_cache is not None and _rules_cache_path == path:
+    file_mtime = _replacements_file_mtime(path)
+    if (
+        not reload
+        and _rules_cache is not None
+        and _rules_cache_path == path
+        and _rules_cache_mtime == file_mtime
+    ):
         return _rules_cache
 
     if not path.is_file():
@@ -143,18 +158,22 @@ def load_tts_replacement_rules(path: Path | None = None, *, reload: bool = False
     else:
         try:
             rules = _parse_replacements_file(path)
-            logger.debug(
-                "Loaded TTS replacements from %s (%s literal, %s regex)",
-                path,
-                len(rules.literals),
-                len(rules.regex),
-            )
+            if _rules_cache is None or _rules_cache_mtime != file_mtime:
+                logger.info(
+                    "Loaded TTS replacements from %s (%s literal, %s regex)",
+                    path,
+                    len(rules.literals),
+                    len(rules.regex),
+                )
         except (OSError, json.JSONDecodeError, ValueError) as e:
             logger.error("Failed to load TTS replacements from %s: %s", path, e)
+            if _rules_cache is not None and _rules_cache_path == path:
+                return _rules_cache
             rules = TtsReplacementRules(literals=[], regex=[])
 
     _rules_cache = rules
     _rules_cache_path = path
+    _rules_cache_mtime = file_mtime
     return rules
 
 
@@ -198,9 +217,10 @@ def normalize_for_tts(
 
 def clear_rules_cache() -> None:
     """Reset cached rules (for tests)."""
-    global _rules_cache, _rules_cache_path
+    global _rules_cache, _rules_cache_path, _rules_cache_mtime
     _rules_cache = None
     _rules_cache_path = None
+    _rules_cache_mtime = None
 
 
 def _default_replacements_document() -> dict:

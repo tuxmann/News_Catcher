@@ -159,6 +159,24 @@
       "to": "You-S",
       "whole_word": true,
       "ignore_case": false
+    },
+    {
+      "from": "Tempe",
+      "to": "Tem-pee",
+      "whole_word": true,
+      "ignore_case": false
+    },
+    {
+      "from": "Saguaro",
+      "to": "Sa wahroh",
+      "whole_word": true,
+      "ignore_case": false
+    },
+    {
+      "from": "politicizes",
+      "to": "Poh-littasizez",
+      "whole_word": true,
+      "ignore_case": true
     }
   ],
   "regex": [
