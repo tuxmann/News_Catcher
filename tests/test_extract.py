@@ -80,6 +80,23 @@ class TestParagraphPreservation(unittest.TestCase):
         self.assertIn("More body", article.text)
         self.assertNotIn("related-article", article.text)
 
+    def test_removes_stray_asterisk_paragraphs(self) -> None:
+        html = b"""<html><body><article>
+<p>He also refused to lay out a timetable for ending the conflict.</p>
+<p>* *</p>
+</article></body></html>"""
+        article = extract_article(html, "https://www.reuters.com/world/example/")
+        self.assertIn("timetable", article.text)
+        self.assertNotRegex(article.text, r"^\s*\*\s*\*\s*$", msg=article.text)
+        self.assertNotIn("* *", article.text)
+
+    def test_keeps_real_italic_emphasis(self) -> None:
+        html = b"""<html><body><article>
+<p>She said <em>never again</em> after the vote.</p>
+</article></body></html>"""
+        article = extract_article(html, "https://www.reuters.com/world/example/")
+        self.assertIn("never again", article.text)
+
     def test_trafilatura_keeps_blank_lines_between_p_tags(self) -> None:
         html = b"""<html><body><article>
 <p>First paragraph here.</p>

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from article_cache import CachedArticle
 from article_export import (
+    domain_to_display_name,
     is_save_to_disk_phrase,
     save_article_text_file,
     site_to_filename_stem,
@@ -48,6 +49,13 @@ class TestTelegramAudioFilename(unittest.TestCase):
     def test_site_stem(self) -> None:
         self.assertEqual(site_to_filename_stem("reuters.com"), "reuters_com")
         self.assertEqual(site_to_filename_stem("www.bbc.com"), "bbc_com")
+
+    def test_display_name(self) -> None:
+        self.assertEqual(domain_to_display_name("hackaday.com"), "Hackaday")
+        self.assertEqual(domain_to_display_name("www.FoxNews.com"), "Foxnews")
+        self.assertEqual(domain_to_display_name("the-register.com"), "The register")
+        self.assertEqual(domain_to_display_name("independent.co.uk"), "Independent")
+        self.assertEqual(domain_to_display_name(None), "News Catcher")
 
     def test_prepends_site(self) -> None:
         self.assertEqual(

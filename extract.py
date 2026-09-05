@@ -8,7 +8,12 @@ from dataclasses import dataclass
 from urllib.parse import urljoin
 
 from article_filters import strip_eliminated_phrases
-from article_format import deduplicate_article_text, strip_link_only_paragraphs
+from article_format import (
+    deduplicate_article_text,
+    strip_link_only_paragraphs,
+    strip_stray_emphasis_markers,
+)
+from article_strip import apply_text_strip_rules, prepare_html_for_extract
 import trafilatura
 from lxml import html
 from readability import Document
@@ -182,6 +187,8 @@ def _extract_images(raw_html: str, source_url: str) -> list[ExtractedImage]:
 def extract_article(html_bytes: bytes, source_url: str) -> ExtractedArticle:
     raw = html_bytes.decode("utf-8", errors="replace")
     images = _extract_images(raw, source_url)
+    # Watchlist sites may strip affiliate/disclaimer blocks before extraction.
+    raw = prepare_html_for_extract(raw, source_url)
 
     meta = trafilatura.extract_metadata(raw, default_url=source_url)
     text = trafilatura.extract(
@@ -201,7 +208,10 @@ def extract_article(html_bytes: bytes, source_url: str) -> ExtractedArticle:
         text = strip_newsletter_signup_paragraphs(text)
         text = strip_eliminated_phrases(text, source_url)
         text = strip_link_only_paragraphs(text)
+        text = strip_stray_emphasis_markers(text)
         text = deduplicate_article_text(text, title=title)
+        # After dedupe so trailing italic ads aren't hidden behind duplicated body copy.
+        text = apply_text_strip_rules(text, source_url)
         return ExtractedArticle(
             title=title,
             author=author,
@@ -217,9 +227,11 @@ def extract_article(html_bytes: bytes, source_url: str) -> ExtractedArticle:
     fallback_text = strip_newsletter_signup_paragraphs(fallback_text)
     fallback_text = strip_eliminated_phrases(fallback_text, source_url)
     fallback_text = strip_link_only_paragraphs(fallback_text)
+    fallback_text = strip_stray_emphasis_markers(fallback_text)
     summary_title = doc.title()
     final_title = summary_title or title
     fallback_text = deduplicate_article_text(fallback_text, title=final_title)
+    fallback_text = apply_text_strip_rules(fallback_text, source_url)
 
     return ExtractedArticle(
         title=final_title,

@@ -15,6 +15,9 @@ _EMPHASIS_RE = re.compile(
 _HEADING_PREFIX_RE = re.compile(r"^\s*#{1,6}\s+")
 _BULLET_PREFIX_RE = re.compile(r"^\s*[-+]\s+")
 
+# Paragraph that is only * / _ markers (empty emphasis leftovers from HTML).
+_STRAY_EMPHASIS_MARKERS_RE = re.compile(r"^[\s*_]+$")
+
 # Paragraph that is only a URL or a single markdown link.
 _LINK_ONLY_RE = re.compile(
     r"^(?:"
@@ -136,6 +139,24 @@ def strip_link_only_paragraphs(text: str) -> str:
         return text
     parts = [p.strip() for p in re.split(r"\n\s*\n+", text.strip()) if p.strip()]
     kept = [p for p in parts if not _paragraph_is_link_only(p)]
+    return "\n\n".join(kept)
+
+
+def strip_stray_emphasis_markers(text: str) -> str:
+    """Drop paragraphs (and trailing lines) that are only * / _ leftovers."""
+    if not text or not text.strip():
+        return text
+    parts = [p.strip() for p in re.split(r"\n\s*\n+", text.strip()) if p.strip()]
+    kept: list[str] = []
+    for para in parts:
+        if _STRAY_EMPHASIS_MARKERS_RE.fullmatch(para):
+            continue
+        lines = para.split("\n")
+        while lines and _STRAY_EMPHASIS_MARKERS_RE.fullmatch(lines[-1].strip()):
+            lines.pop()
+        cleaned = "\n".join(lines).strip()
+        if cleaned:
+            kept.append(cleaned)
     return "\n\n".join(kept)
 
 

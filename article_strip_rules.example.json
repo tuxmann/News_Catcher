@@ -1,0 +1,11 @@
+{
+  "sites": {
+    "electrek.co": {
+      "html_selectors": [
+        ".ad-disclaimer-container",
+        ".disclaimer-affiliate"
+      ],
+      "drop_trailing_emphasis_paragraphs": true
+    }
+  }
+}

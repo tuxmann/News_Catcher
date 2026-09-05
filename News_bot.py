@@ -41,6 +41,7 @@ from article_filters import (
 from article_format import format_paragraphs_for_telegram
 from article_cache import load_last_article, purge_expired as purge_article_cache, save_last_article
 from article_export import (
+    domain_to_display_name,
     is_save_to_disk_phrase,
     save_article_text_file,
     telegram_audio_filename,
@@ -57,6 +58,15 @@ from domains_store import (
     registrable_domain_from_url,
     save_bad_domains,
     save_domains,
+)
+from article_strip import (
+    SiteStripRules,
+    add_html_selector,
+    domain_is_watchlisted,
+    load_strip_rules,
+    remove_site_rules,
+    set_trailing_emphasis,
+    watchlist_domains,
 )
 from extract import extract_article
 from fetch import (
@@ -210,6 +220,9 @@ _BOT_COMMAND_NAMES = frozenset(
         "eliminate_phrase",
         "list_eliminate_phrases",
         "remove_eliminate_phrase",
+        "strip_rule",
+        "list_strip_rules",
+        "remove_strip_rule",
     }
 )
 
@@ -263,6 +276,7 @@ _RESEARCH_CHAT_TTL = 24 * 3600
 # Inline actions after an article is delivered (callback_data must be <= 64 bytes).
 _CALLBACK_SPEAK = "a:speak"
 _CALLBACK_SAVE = "a:save"
+_CALLBACK_ELIMINATE = "a:elim"
 _CALLBACK_WORD_FIX = "a:wordfix"
 _CALLBACK_WORD_FIX_RETRY = "wf:retry"
 _CALLBACK_WORD_FIX_FEEDBACK = "wf:feedback"
@@ -419,6 +433,11 @@ def _article_actions_keyboard(*, block_token: str | None = None) -> InlineKeyboa
         [
             InlineKeyboardButton("Speak to me", callback_data=_CALLBACK_SPEAK),
             InlineKeyboardButton("Save to disk", callback_data=_CALLBACK_SAVE),
+        ],
+        [
+            InlineKeyboardButton(
+                "Eliminate phrase", callback_data=_CALLBACK_ELIMINATE
+            ),
         ],
     ]
     if block_token:
@@ -1317,6 +1336,47 @@ async def _process_fetched_html(
         )
 
 
+async def _start_eliminate_phrase_prompt(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    user_id: int,
+    chat_id: int,
+) -> None:
+    """Prompt for a phrase to strip, using the last article's site when known."""
+    domain: str | None = None
+    cached = load_last_article(
+        config.ARTICLE_CACHE_DIR,
+        user_id,
+        ttl_seconds=config.LAST_ARTICLE_TTL_SECONDS,
+    )
+    if cached and cached.url:
+        domain = normalize_site_key(cached.url)
+        if domain and not is_valid_registrable_domain(domain):
+            domain = None
+
+    if domain:
+        _pending_eliminate_phrase_put(
+            user_id, domain=domain, step="awaiting_phrase"
+        )
+        await context.bot.send_message(
+            chat_id,
+            f"What phrase should I strip from {domain} articles?\n\n"
+            "Example: CLICK HERE TO DOWNLOAD THE FOX NEWS APP\n\n"
+            "Send /nevermind to cancel.",
+        )
+        return
+
+    _pending_eliminate_phrase_put(
+        user_id, domain=None, step="awaiting_website"
+    )
+    await context.bot.send_message(
+        chat_id,
+        "What website should this phrase be removed from?\n\n"
+        "Example: foxnews.com\n\n"
+        "Send /nevermind to cancel.",
+    )
+
+
 async def _start_word_fix_prompt(
     context: ContextTypes.DEFAULT_TYPE,
     *,
@@ -1656,8 +1716,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Send me a message containing a news article URL (HTTPS, approved domain). "
         "I will fetch and return readable text.\n\n"
         + domain_note
-        + "After each article you can tap Speak to me or Save to disk, "
-        "or type those phrases.\n"
+        + "After each article you can tap Speak to me, Save to disk, "
+        "or Eliminate phrase (or type the speak/save phrases).\n"
         "Deep research: /research — I'll ask for a topic, article count, and length\n"
         "  or send a Google News Full Coverage link\n"
         "After a research article, ask follow-up questions in plain text.\n"
@@ -1672,6 +1732,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "     /nevermind — cancel fix-a-word or other in-progress prompts\n"
         "Filter: /eliminate_phrase — I'll ask for the website, then the phrase to strip\n"
         "        /list_eliminate_phrases [site], /remove_eliminate_phrase <site> <phrase>\n"
+        "        /strip_rule — ad/disclaimer filters for watched blogs (italic + CSS)\n"
+        "        /list_strip_rules, /remove_strip_rule\n"
         "Watch: /watch_add — I'll ask for the site (and check interval)\n"
         "       /watch_remove and /watch_interval work the same way\n"
         "       No automatic checks during do-not-disturb hours (default 12am–4am local)\n"
@@ -2342,6 +2404,10 @@ async def _run_speak(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     parts = split_mp3_for_telegram(out_path, config.TELEGRAM_AUDIO_MAX_BYTES)
     title = (cached.title or "Article")[:64]
+    performer = domain_to_display_name(
+        source_domain,
+        fallback="Deep research" if is_research_article_url(cached.url) else "News Catcher",
+    )
     total = len(parts)
     for i, part in enumerate(parts, start=1):
         part_title = f"{title} ({i}/{total})" if total > 1 else title
@@ -2355,7 +2421,7 @@ async def _run_speak(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     chat_id,
                     InputFile(audio_file, filename=filename),
                     title=part_title,
-                    performer="News Catcher",
+                    performer=performer,
                 )
         except TelegramError as e:
             await _bot_send_text(update, context, f"Could not send audio: {e}", chat_id=chat_id)
@@ -3102,7 +3168,12 @@ async def on_article_action_callback(
         return
 
     data = query.data
-    if data not in (_CALLBACK_SPEAK, _CALLBACK_SAVE, _CALLBACK_WORD_FIX):
+    if data not in (
+        _CALLBACK_SPEAK,
+        _CALLBACK_SAVE,
+        _CALLBACK_ELIMINATE,
+        _CALLBACK_WORD_FIX,
+    ):
         await query.answer()
         return
 
@@ -3116,6 +3187,14 @@ async def on_article_action_callback(
         _schedule_speak(update, context)
     elif data == _CALLBACK_SAVE:
         await _run_save_to_disk(update, context)
+    elif data == _CALLBACK_ELIMINATE:
+        user_id = update.effective_user.id
+        chat_id = _action_chat_id(update)
+        if chat_id is None:
+            return
+        await _start_eliminate_phrase_prompt(
+            context, user_id=user_id, chat_id=chat_id
+        )
     elif data == _CALLBACK_WORD_FIX:
         user_id = update.effective_user.id
         chat_id = _action_chat_id(update)
@@ -3334,7 +3413,182 @@ async def _handle_pending_command_message(
         await cmd_override_bad_domain(update, context)
         return True
 
+    if command == "strip_rule" and step == "awaiting_website":
+        domain = normalize_site_key(text) or domain_hint_from_user_input(text)
+        if not domain or not is_valid_registrable_domain(domain):
+            await update.message.reply_text(
+                "That doesn't look like a website. Try electrek.co"
+            )
+            return True
+        domain = normalize_registrable_hint(domain)
+        if not domain_is_watchlisted(domain):
+            watched = ", ".join(sorted(watchlist_domains())) or "(none)"
+            await update.message.reply_text(
+                f"{domain} is not on your blog watchlist.\n"
+                "Strip rules only apply to watched sites for now.\n"
+                f"Currently watching: {watched}\n\n"
+                "Add it with /watch_add first, then /strip_rule again."
+            )
+            return True
+        _pending_command_put(
+            user_id,
+            "strip_rule",
+            step="awaiting_action",
+            data={"domain": domain},
+        )
+        await update.message.reply_text(
+            f"Configure strip rules for {domain}. Reply with one of:\n\n"
+            "• italic — drop trailing wholly-italic paragraphs (Electrek-style ads)\n"
+            "• a CSS selector — e.g. .disclaimer-affiliate\n"
+            "• done — finish\n\n"
+            "Send /nevermind to cancel."
+        )
+        return True
+
+    if command == "strip_rule" and step == "awaiting_action":
+        domain = str(pending.data.get("domain") or "").strip()
+        if not domain:
+            _pending_command_clear(user_id)
+            await update.message.reply_text("Session expired. Send /strip_rule again.")
+            return True
+        reply = text.strip()
+        low = reply.casefold()
+        if low in {"done", "finish", "ok"}:
+            _pending_command_clear(user_id)
+            rules = load_strip_rules().get(domain)
+            if rules is None:
+                await update.message.reply_text(f"No strip rules saved for {domain}.")
+            else:
+                await update.message.reply_text(_format_strip_rules_summary(domain, rules))
+            return True
+        if low in {"italic", "trailing italic", "emphasis"}:
+            rules = set_trailing_emphasis(domain, True)
+            await update.message.reply_text(
+                f"Enabled trailing-italic stripping for {domain}.\n\n"
+                "Add a CSS selector next, or reply done.\n"
+                f"Current: {_format_strip_rules_summary(domain, rules)}"
+            )
+            return True
+        # Treat as CSS selector
+        try:
+            added = add_html_selector(domain, reply)
+        except ValueError as e:
+            await update.message.reply_text(str(e))
+            return True
+        rules = load_strip_rules().get(domain)
+        verb = "Added" if added else "Already had"
+        await update.message.reply_text(
+            f"{verb} selector {reply!r} for {domain}.\n"
+            "Add another, reply italic, or done.\n\n"
+            + (
+                _format_strip_rules_summary(domain, rules)
+                if rules
+                else "(no rules)"
+            )
+        )
+        return True
+
+    if command == "remove_strip_rule" and step == "awaiting_website":
+        domain = normalize_site_key(text) or domain_hint_from_user_input(text)
+        if not domain:
+            await update.message.reply_text("Could not parse domain.")
+            return True
+        domain = normalize_registrable_hint(domain)
+        _pending_command_clear(user_id)
+        if remove_site_rules(domain):
+            await update.message.reply_text(f"Removed all strip rules for {domain}.")
+        else:
+            await update.message.reply_text(f"No strip rules found for {domain}.")
+        return True
+
     return False
+
+
+def _format_strip_rules_summary(domain: str, rules: SiteStripRules) -> str:
+    lines = [f"{domain}:"]
+    lines.append(
+        f"  trailing italic: {'on' if rules.drop_trailing_emphasis_paragraphs else 'off'}"
+    )
+    if rules.html_selectors:
+        lines.append("  CSS selectors:")
+        for sel in rules.html_selectors:
+            lines.append(f"    • {sel}")
+    else:
+        lines.append("  CSS selectors: (none)")
+    return "\n".join(lines)
+
+
+async def cmd_strip_rule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not _allowed_user(update.effective_user.id):
+        await update.message.reply_text("You are not authorized.")
+        return
+    watched = sorted(watchlist_domains())
+    _pending_command_put(
+        update.effective_user.id, "strip_rule", step="awaiting_website"
+    )
+    hint = ", ".join(watched) if watched else "(none yet — /watch_add a blog first)"
+    await update.message.reply_text(
+        "Which watched website should get ad/disclaimer strip rules?\n\n"
+        f"Watchlist: {hint}\n\n"
+        "Send /nevermind to cancel."
+    )
+
+
+async def cmd_list_strip_rules(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not _allowed_user(update.effective_user.id):
+        await update.message.reply_text("You are not authorized.")
+        return
+    rules = load_strip_rules()
+    if not rules:
+        await update.message.reply_text(
+            "No strip rules yet. Electrek is seeded in data/article_strip_rules.json "
+            "when present. Use /strip_rule to configure a watched site."
+        )
+        return
+    watched = watchlist_domains()
+    blocks = []
+    for domain, site_rules in sorted(rules.items()):
+        active = "active" if domain in watched or domain_is_watchlisted(domain) else "inactive (not on watchlist)"
+        blocks.append(
+            _format_strip_rules_summary(domain, site_rules) + f"\n  status: {active}"
+        )
+    await update.message.reply_text(
+        "Article strip rules (apply only while the site is on /watch_list):\n\n"
+        + "\n\n".join(blocks)
+    )
+
+
+async def cmd_remove_strip_rule(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not _allowed_user(update.effective_user.id):
+        await update.message.reply_text("You are not authorized.")
+        return
+    args = context.args or []
+    if args:
+        domain = normalize_site_key(args[0]) or domain_hint_from_user_input(args[0])
+        if not domain:
+            await update.message.reply_text("Could not parse domain.")
+            return
+        if remove_site_rules(domain):
+            await update.message.reply_text(f"Removed all strip rules for {domain}.")
+        else:
+            await update.message.reply_text(f"No strip rules found for {domain}.")
+        return
+    _pending_command_put(
+        update.effective_user.id, "remove_strip_rule", step="awaiting_website"
+    )
+    await update.message.reply_text(
+        "Which website's strip rules should I remove?\n\nSend /nevermind to cancel."
+    )
 
 
 async def on_research_config_callback(
@@ -4271,6 +4525,16 @@ async def on_watch_post_callback(
         chat_id = _action_chat_id(update)
         if chat_id is None:
             return
+        # Single post: skip the picker and run immediately.
+        if len(pending.posts) == 1:
+            selected = list(pending.posts)
+            if pending.action == "read":
+                await _read_watch_posts(update, context, selected)
+            else:
+                _schedule_watch_speak(
+                    update, context, user_id=pending.user_id, posts=selected
+                )
+            return
         verb = "Read" if pending.action == "read" else "Speak"
         lines = [f"{verb} which post from {pending.domain}?"]
         for i, post in enumerate(pending.posts, start=1):
@@ -4539,6 +4803,9 @@ async def _post_init(app: Application) -> None:
                 BotCommand(
                     "remove_eliminate_phrase", "Stop stripping a phrase from a site"
                 ),
+                BotCommand("strip_rule", "Ad filters for a watched blog"),
+                BotCommand("list_strip_rules", "List article strip rules"),
+                BotCommand("remove_strip_rule", "Remove strip rules for a site"),
                 BotCommand("list_domains", "List approved news domains"),
                 BotCommand("add_domain", "Add an approved domain"),
                 BotCommand("remove_domain", "Remove an approved domain"),
@@ -4651,6 +4918,9 @@ def main() -> None:
     app.add_handler(CommandHandler("eliminate_phrase", cmd_eliminate_phrase))
     app.add_handler(CommandHandler("list_eliminate_phrases", cmd_list_eliminate_phrases))
     app.add_handler(CommandHandler("remove_eliminate_phrase", cmd_remove_eliminate_phrase))
+    app.add_handler(CommandHandler("strip_rule", cmd_strip_rule))
+    app.add_handler(CommandHandler("list_strip_rules", cmd_list_strip_rules))
+    app.add_handler(CommandHandler("remove_strip_rule", cmd_remove_strip_rule))
     app.add_handler(CallbackQueryHandler(on_eliminate_delete_callback, pattern=r"^ed:"))
     app.add_handler(CallbackQueryHandler(on_pronunciation_callback, pattern=r"^ri?:"))
     app.add_handler(CallbackQueryHandler(on_rule_action_callback, pattern=r"^r[pdna]:"))

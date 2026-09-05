@@ -32,6 +32,7 @@ If you maintain a fork or publish this repo, add [Topics](https://docs.github.co
 - **Speak last article**: after a URL, send `newscatcher, speak to me` for TTS audio (KittenTTS)
 - **Deep research**: conversational `/research` — topic, article count (10/25/50), length preset → Ollama writes a neutral news article → follow-up Q&A → TTS with Deep research outro
 - **Blog watchlist**: poll RSS/WordPress for new posts; do-not-disturb window (default 12am–4am local); Read or Speak digests in Telegram
+- **Article cleanup**: drop stray `*` leftovers, exact promo phrases (`/eliminate_phrase`), and watchlist-gated ad/disclaimer rules (`/strip_rule`)
 - **Overnight briefing** (optional): `python -m briefing` → Google Drive (`briefing.yaml`, see `.env.example`)
 
 ## Example Target Domains
@@ -54,13 +55,20 @@ You can add/remove domains at runtime with bot commands.
 - `fetch.py` - HTTP fetching, redirects, limits, anti-SSRF checks, Playwright fallback trigger
 - `fetch_playwright.py` - Headless Chromium fetch for challenge-protected pages
 - `extract.py` - Article extraction (`trafilatura` + readability fallback)
+- `article_format.py` - Paragraph cleanup, stray `*`/`_` markers, Telegram HTML emphasis
+- `article_filters.py` - Per-site exact phrase elimination (`/eliminate_phrase`)
+- `article_strip.py` - Watchlist-gated HTML selectors + trailing italic ads (`/strip_rule`)
+- `article_strip_rules.example.json` - Example Electrek strip rules (copy to `data/article_strip_rules.json` or use `/strip_rule`)
 - `domains_store.py` - Load/save domain allowlist and host matching
 - `config.py` - Environment/config loading
 - `domains.json` - Approved domains list
 - `data/watchlist.json` - Watched blogs (created at runtime)
+- `data/eliminate_phrases.json` - Phrase filters (created at runtime)
+- `data/article_strip_rules.json` - Ad/disclaimer strip rules (created at runtime)
 - `watchlist.py` / `watchlist_store.py` - Blog watchlist: RSS/WordPress polling, DND quiet hours
 - `.env.example` - Example environment configuration
 - `article_cache.py` - Last article per user (for TTS)
+- `article_export.py` - Save-to-disk naming; Telegram audio filename and performer (site display name)
 - `tts.py` - KittenTTS + ffmpeg MP3 generation
 - `briefing/` - Overnight multi-source briefing → Google Drive
 - `docs/NewsCatcher_logo.png` - Project logo (shown above)
@@ -151,9 +159,29 @@ Each chunk starts with:
 
 ### After each article
 
-The bot shows inline buttons: **Speak to me** and **Save to disk**. You can tap those or type `newscatcher, speak to me` / `newscatcher, save to disk`.
+The bot shows inline buttons: **Speak to me**, **Save to disk**, and **Eliminate phrase**. You can tap Speak/Save or type `newscatcher, speak to me` / `newscatcher, save to disk`.
+
+**Eliminate phrase** asks for the exact promo/boilerplate string to strip from that site on future fetches (same store as `/eliminate_phrase`). The website is taken from the article you just read.
 
 **Save to disk** writes the last article body to `test_articles/` as a `.txt` file named from the **first six words** of the title (underscores between words). Override directory with `TEST_ARTICLES_DIR` in `.env`.
+
+Spoken audio uses the site as Telegram **performer** (e.g. `hackaday.com` → `Hackaday`) and prefixes the filename with the site stem.
+
+### Article text cleanup
+
+Extraction always:
+
+- Drops newsletter CTAs like a standalone “Sign up here.”
+- Drops link-only paragraphs
+- Drops stray emphasis leftovers such as a trailing `* *` paragraph
+- Applies your per-site **eliminate phrases** (`data/eliminate_phrases.json`)
+
+For **watchlisted** blogs only, optional strip rules (`data/article_strip_rules.json`) can also:
+
+1. Remove HTML nodes by CSS selector (e.g. Electrek affiliate disclaimer containers)
+2. Drop trailing wholly-italic paragraphs (common affiliate pitches)
+
+Configure in Telegram with `/strip_rule` (site must be on the watchlist), or copy [`article_strip_rules.example.json`](article_strip_rules.example.json) to `data/article_strip_rules.json`. Paths: `ELIMINATE_PHRASES_FILE`, `ARTICLE_STRIP_RULES_FILE` in `.env`.
 
 ### Test article → audio (local experiments)
 
@@ -315,7 +343,10 @@ Many commands work **conversationally**: send the command alone and the bot asks
 | `/find_pronunciation` | Asks search term | `/find_pronunciation <word>` |
 | `/delete_pronunciation` | Asks rule to delete | `/delete_pronunciation <from>` |
 | `/fixaword` | Fix-a-word on last audio | — |
-| `/eliminate_phrase` | Website → phrase to strip | — |
+| `/eliminate_phrase` | Website → phrase to strip (also: **Eliminate phrase** after an article) | — |
+| `/strip_rule` | Watched site → italic and/or CSS selectors | — |
+| `/list_strip_rules` | List ad/disclaimer strip rules | — |
+| `/remove_strip_rule` | Asks site | `/remove_strip_rule <site>` |
 | `/watch_add` | Site → interval | `/watch_add <site> [minutes]` |
 | `/watch_remove` | Asks site | `/watch_remove <site>` |
 | `/watch_interval` | Site → interval | `/watch_interval <site> <minutes>` |
@@ -410,9 +441,11 @@ PYTHONPATH=. python -m unittest discover -s tests -v
 
 Includes tests for:
 
-- extraction output
+- extraction output and paragraph preservation
+- stray emphasis / phrase / strip-rule cleanup
 - paragraph/chunk formatting
 - domain allowlist matching
+- article export naming and performer labels
 
 ## Troubleshooting
 

@@ -39,6 +39,29 @@ def site_to_filename_stem(source_domain: str | None) -> str:
     return (stem or "article")[:60]
 
 
+def domain_to_display_name(
+    source_domain: str | None, *, fallback: str = "News Catcher"
+) -> str:
+    """
+    Site label for Telegram audio performer: drop TLD, capitalize first letter.
+
+    hackaday.com → Hackaday
+    the-register.com → The register
+    """
+    if not source_domain or not source_domain.strip():
+        return fallback
+    raw = source_domain.strip().lower().rstrip(".")
+    if raw.startswith("www."):
+        raw = raw[4:]
+    if not raw:
+        return fallback
+    label = raw.split(".", 1)[0].replace("-", " ")
+    label = " ".join(label.split())
+    if not label:
+        return fallback
+    return label[:1].upper() + label[1:]
+
+
 def telegram_audio_filename(
     source_domain: str | None,
     title: str | None,
