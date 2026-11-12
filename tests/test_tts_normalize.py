@@ -77,7 +77,7 @@ class TestNormalizeForTts(unittest.TestCase):
         out = normalize_for_tts(
             "It flew 3,000km across the desert.", rules=rules, enabled=True
         )
-        self.assertEqual(out, "It flew three thousand across the desert.")
+        self.assertEqual(out, "It flew three, thousand across the desert.")
 
     def test_drop_redundant_acronym_paren(self) -> None:
         rules = TtsReplacementRules(literals=[], regex=[])

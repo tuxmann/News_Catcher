@@ -1,4 +1,4 @@
-"""Tests for long-number → words TTS expansion."""
+"""Tests for number → words TTS expansion."""
 
 from __future__ import annotations
 
@@ -10,53 +10,79 @@ from tts_numbers import apply_long_numbers, number_token_to_words
 
 class TestNumberTokenToWords(unittest.TestCase):
     def test_year_1977(self) -> None:
-        self.assertEqual(number_token_to_words("1977"), "nineteen seventy seven")
+        self.assertEqual(number_token_to_words("1977"), "nineteen, seventy-seven")
 
     def test_year_1900(self) -> None:
-        self.assertEqual(number_token_to_words("1900"), "nineteen hundred")
+        self.assertEqual(number_token_to_words("1900"), "nineteen, hundred")
 
     def test_year_1905(self) -> None:
-        self.assertEqual(number_token_to_words("1905"), "nineteen oh five")
+        self.assertEqual(number_token_to_words("1905"), "nineteen, oh, five")
 
     def test_year_2000(self) -> None:
-        self.assertEqual(number_token_to_words("2000"), "two thousand")
+        self.assertEqual(number_token_to_words("2000"), "two, thousand")
 
     def test_year_2005(self) -> None:
-        self.assertEqual(number_token_to_words("2005"), "two thousand five")
+        self.assertEqual(number_token_to_words("2005"), "two, thousand, five")
 
     def test_year_2015(self) -> None:
-        self.assertEqual(number_token_to_words("2015"), "twenty fifteen")
+        self.assertEqual(number_token_to_words("2015"), "twenty, fifteen")
 
     def test_three_digit_cardinal(self) -> None:
-        self.assertEqual(number_token_to_words("500"), "five hundred")
-        self.assertEqual(number_token_to_words("123"), "one hundred twenty three")
+        self.assertEqual(number_token_to_words("500"), "five, hundred")
+        self.assertEqual(
+            number_token_to_words("123"),
+            "one, hundred, twenty-three",
+        )
 
     def test_comma_quantity_not_year(self) -> None:
-        self.assertEqual(number_token_to_words("1,977"), "one thousand nine hundred seventy seven")
+        self.assertEqual(
+            number_token_to_words("1,977"),
+            "one, thousand, nine, hundred, seventy-seven",
+        )
 
     def test_thousands_with_commas(self) -> None:
-        self.assertEqual(number_token_to_words("3,000"), "three thousand")
+        self.assertEqual(number_token_to_words("3,000"), "three, thousand")
         self.assertEqual(
             number_token_to_words("12,345"),
-            "twelve thousand three hundred forty five",
+            "twelve, thousand, three, hundred, forty-five",
         )
+
+    def test_example_67829(self) -> None:
+        self.assertEqual(
+            number_token_to_words("67,829"),
+            "sixty-seven, thousand, eight, hundred, twenty-nine",
+        )
+
+    def test_single_and_two_digit(self) -> None:
+        self.assertEqual(number_token_to_words("7"), "seven")
+        self.assertEqual(number_token_to_words("12"), "twelve")
+        self.assertEqual(number_token_to_words("42"), "forty-two")
 
 
 class TestApplyLongNumbers(unittest.TestCase):
     def test_sentence_year(self) -> None:
         self.assertEqual(
             apply_long_numbers("The U.S. in 1977 under former President."),
-            "The U.S. in nineteen seventy seven under former President.",
+            "The U.S. in nineteen, seventy-seven under former President.",
         )
 
-    def test_leaves_one_and_two_digit(self) -> None:
-        self.assertEqual(apply_long_numbers("On day 7 of week 12."), "On day 7 of week 12.")
+    def test_expands_one_and_two_digit(self) -> None:
+        self.assertEqual(
+            apply_long_numbers("On day 7 of week 12."),
+            "On day seven of week twelve.",
+        )
 
     def test_skips_letter_hyphen_codes(self) -> None:
         self.assertEqual(apply_long_numbers("The A-380 landed."), "The A-380 landed.")
 
     def test_skips_decimals(self) -> None:
         self.assertEqual(apply_long_numbers("Pi is 3.141."), "Pi is 3.141.")
+
+    def test_sentence_ending_number(self) -> None:
+        self.assertEqual(
+            apply_long_numbers("Attendance hit 67,829."),
+            "Attendance hit sixty-seven, thousand, eight, hundred, twenty-nine.",
+        )
 
 
 class TestNormalizeIntegratesNumbers(unittest.TestCase):
@@ -75,7 +101,7 @@ class TestNormalizeIntegratesNumbers(unittest.TestCase):
         )
         self.assertEqual(
             out,
-            "The U.S. in nineteen seventy seven under former President.",
+            "The U.S. in nineteen, seventy-seven under former President.",
         )
 
     def test_distance_then_words(self) -> None:
@@ -83,7 +109,7 @@ class TestNormalizeIntegratesNumbers(unittest.TestCase):
         out = normalize_for_tts(
             "It flew 3,000km across the desert.", rules=rules, enabled=True
         )
-        self.assertEqual(out, "It flew three thousand across the desert.")
+        self.assertEqual(out, "It flew three, thousand across the desert.")
 
 
 if __name__ == "__main__":

@@ -1,15 +1,16 @@
-"""Expand long numbers (3+ digits) to words for clearer KittenTTS speech."""
+"""Expand standalone numbers to words for clearer KittenTTS speech."""
 
 from __future__ import annotations
 
 import re
 
-# Standalone 3+ digit ints, including comma groups (1,000). Skip letter-hyphen
-# model codes (A-380) and decimals (3.14 / .5).
-_LONG_NUMBER_RE = re.compile(
+# Standalone ints, including comma groups (1,000). Skip letter-hyphen
+# model codes (A-380) and decimals (3.14 / .5). Allow trailing sentence
+# periods ("12.") while rejecting true decimals ("3.14").
+_NUMBER_RE = re.compile(
     r"(?<![A-Za-z0-9.])(?<![A-Za-z]-)"
-    r"(?P<num>\d{1,3}(?:,\d{3})+|\d{3,})"
-    r"(?![A-Za-z0-9.]|\.\d)"
+    r"(?P<num>\d{1,3}(?:,\d{3})+|\d+)"
+    r"(?!\.\d)(?![A-Za-z0-9])"
 )
 
 _ONES = (
@@ -49,13 +50,21 @@ _TENS = (
     "ninety",
 )
 
-# Typical news-year window → pair reading ("nineteen seventy seven").
+# Typical news-year window → pair reading ("nineteen, seventy-seven").
 _YEAR_MIN = 1000
 _YEAR_MAX = 2099
 
 
+def _pace_for_tts(words: str) -> str:
+    """Join spoken words with commas so KittenTTS does not swallow syllables."""
+    parts = words.split()
+    if len(parts) <= 1:
+        return words
+    return ", ".join(parts)
+
+
 def _two_digits(n: int) -> str:
-    """0–99 as spoken words (spaces, no hyphens)."""
+    """0–99 as spoken words (hyphenated compounds)."""
     if n < 0 or n > 99:
         raise ValueError(f"expected 0–99, got {n}")
     if n < 10:
@@ -65,7 +74,7 @@ def _two_digits(n: int) -> str:
     tens, ones = divmod(n, 10)
     if ones == 0:
         return _TENS[tens]
-    return f"{_TENS[tens]} {_ONES[ones]}"
+    return f"{_TENS[tens]}-{_ONES[ones]}"
 
 
 def _under_thousand(n: int) -> str:
@@ -108,7 +117,7 @@ def _year(n: int) -> str:
     """
     Four-digit year reading for KittenTTS.
 
-    1977 → nineteen seventy seven
+    1977 → nineteen seventy-seven
     1900 → nineteen hundred
     1905 → nineteen oh five
     2000 → two thousand
@@ -136,23 +145,25 @@ def _year(n: int) -> str:
 
 
 def number_token_to_words(token: str) -> str:
-    """Convert a digit token (optional commas) to spoken words."""
+    """Convert a digit token (optional commas) to paced spoken words."""
     raw = token.replace(",", "")
     if not raw.isdigit():
         return token
     n = int(raw)
     # Bare 4-digit years without commas → year cadence; comma form is a quantity.
     if "," not in token and _YEAR_MIN <= n <= _YEAR_MAX and len(raw) == 4:
-        return _year(n)
-    return _cardinal(n)
+        spoken = _year(n)
+    else:
+        spoken = _cardinal(n)
+    return _pace_for_tts(spoken)
 
 
 def apply_long_numbers(text: str) -> str:
-    """Replace standalone 3+ digit numbers with spoken words."""
+    """Replace standalone numbers with paced spoken words."""
     if not text:
         return text
 
     def _sub(match: re.Match[str]) -> str:
         return number_token_to_words(match.group("num"))
 
-    return _LONG_NUMBER_RE.sub(_sub, text)
+    return _NUMBER_RE.sub(_sub, text)
